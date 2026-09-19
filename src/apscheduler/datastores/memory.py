@@ -5,7 +5,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import MAXYEAR, datetime, timedelta, timezone
 from functools import partial
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import attrs
 
@@ -227,6 +227,7 @@ class MemoryDataStore(BaseDataStore):
     ) -> list[Job]:
         now = datetime.now(timezone.utc)
         acquired_until = now + lease_duration
+        lease_token = uuid4()
         jobs: list[Job] = []
         job_results: dict[Job, JobResult] = {}
         for job in self._jobs_by_id.values():
@@ -264,9 +265,13 @@ class MemoryDataStore(BaseDataStore):
                 continue
 
             # Mark the job as acquired by this worker
-            jobs.append(job)
             job.acquired_by = scheduler_id
             job.acquired_until = acquired_until
+            job.lease_token = lease_token
+
+            # Return a snapshot of the job, as the stored job may be re-acquired (and
+            # thus modified) by another scheduler later
+            jobs.append(attrs.evolve(job))
 
             # Increment the number of running jobs for this task
             task.running_jobs += 1
@@ -283,21 +288,48 @@ class MemoryDataStore(BaseDataStore):
 
         # Discard the jobs that could not start
         for job, result in job_results.items():
-            await self.release_job(scheduler_id, job, result)
+            await self._release_job(
+                scheduler_id, job, result, decrement_running_job_count=False
+            )
 
         return jobs
 
     async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
+        stored_job = self._jobs_by_id.get(result.job_id)
+        if stored_job is None:
+            self._logger.info(
+                "Not releasing job %s: it has already been released", result.job_id
+            )
+            return
+
+        if job.lease_token is None or stored_job.lease_token != job.lease_token:
+            self._logger.info(
+                "Not releasing job %s: the lease held by %r is no longer valid",
+                result.job_id,
+                scheduler_id,
+            )
+            return
+
+        await self._release_job(scheduler_id, stored_job, result)
+
+    async def _release_job(
+        self,
+        scheduler_id: str,
+        job: Job,
+        result: JobResult,
+        *,
+        decrement_running_job_count: bool = True,
+    ) -> None:
         # Record the job result
         if result.expires_at > result.finished_at:
             self._job_results[result.job_id] = result
 
         # Decrement the number of running jobs for this task
-        if job.acquired_by:
+        if decrement_running_job_count:
             self._tasks[job.task_id].running_jobs -= 1
 
         # Delete the job
-        job = self._jobs_by_id.pop(result.job_id)
+        del self._jobs_by_id[job.id]
 
         # Remove the job from the jobs belonging to its task
         task_jobs = self._jobs_by_task_id[job.task_id]
@@ -350,7 +382,7 @@ class MemoryDataStore(BaseDataStore):
                 result = JobResult.from_job(
                     job=job, outcome=JobOutcome.abandoned, finished_at=now
                 )
-                await self.release_job(job.acquired_by, job, result)
+                await self._release_job(scheduler_id, job, result)
 
     async def cleanup(self) -> None:
         # Clean up expired job results
@@ -374,7 +406,7 @@ class MemoryDataStore(BaseDataStore):
                 job=job, outcome=JobOutcome.abandoned, finished_at=now
             )
             assert job.acquired_by is not None
-            await self.release_job(job.acquired_by, job, result)
+            await self._release_job(job.acquired_by, job, result)
 
         # Release any schedules whose leases have expired
         for schedule in self._schedules:

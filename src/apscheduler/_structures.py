@@ -283,6 +283,10 @@ class Job:
         acquired the job for execution
     :var str | None acquired_until: the time after which other schedulers are free to
         acquire the job for processing even if it is still marked as acquired
+    :var ~uuid.UUID | None lease_token: a token that uniquely identifies the current
+        lease on this job; regenerated on every acquisition and required to match when
+        releasing the job, so that stale holders of an expired lease cannot interfere
+        with the current holder
     """
 
     id: UUID = attrs.field(factory=uuid4, on_setattr=frozen)
@@ -317,6 +321,7 @@ class Job:
     acquired_until: datetime | None = attrs.field(
         converter=as_aware_datetime, default=None, repr=False
     )
+    lease_token: UUID | None = attrs.field(default=None, repr=False)
 
     @property
     def original_scheduled_time(self) -> datetime | None:
@@ -333,6 +338,7 @@ class Job:
         if not self.acquired_by:
             del marshalled["acquired_by"]
             del marshalled["acquired_until"]
+            del marshalled["lease_token"]
 
         return marshalled
 

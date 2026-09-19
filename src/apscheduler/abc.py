@@ -325,6 +325,10 @@ class DataStore(metaclass=ABCMeta):
         This method claims up to the requested number of jobs for the given scheduler
         and returns them.
 
+        Every acquisition assigns a new lease token to each claimed job, invalidating
+        any previously held lease on it. The returned jobs carry this token, and it
+        must be presented when releasing the job (see :meth:`release_job`).
+
         :param scheduler_id: unique identifier of the scheduler
         :param lease_duration: the duration of the lease, after which the jobs will be
             considered to be dead if the scheduler doesn't extend the lease duration
@@ -337,8 +341,16 @@ class DataStore(metaclass=ABCMeta):
         """
         Release the claim on the given job and record the result.
 
+        The release only takes effect if the caller still holds a valid lease on the
+        job, that is, the job's current lease token matches the one on the given job
+        object. If the lease has expired and the job has since been re-acquired (by
+        any scheduler, including the same one), or the job has already been released,
+        this method does nothing: no result is recorded, no task counters are changed
+        and no JobReleased event is published.
+
         :param scheduler_id: unique identifier of the scheduler
-        :param job: the job to be released
+        :param job: the job to be released (must be the object originally returned by
+            :meth:`acquire_jobs`, carrying the lease token of that acquisition)
         :param result: the result of the job
         """
 
@@ -372,6 +384,10 @@ class DataStore(metaclass=ABCMeta):
     ) -> None:
         """
         Extend the leases of specified jobs acquired by the given scheduler.
+
+        Only jobs currently marked as acquired by the given scheduler are affected;
+        jobs whose leases have expired and have been re-acquired by another scheduler
+        are left untouched.
 
         :param scheduler_id: unique identifier of the scheduler
         :param job_ids: the identifiers of the jobs the scheduler is running

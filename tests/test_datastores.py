@@ -21,6 +21,7 @@ from apscheduler import (
     Event,
     Job,
     JobOutcome,
+    JobReleased,
     JobResult,
     Schedule,
     ScheduleAdded,
@@ -650,6 +651,197 @@ async def test_acquire_jobs_max_number_exceeded(datastore: DataStore) -> None:
     acquired_jobs = await datastore.acquire_jobs("worker1", timedelta(seconds=30), 3)
     assert [job.id for job in acquired_jobs] == [jobs[2].id]
     assert (await datastore.get_task("task1")).running_jobs == 2
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_release_job_with_expired_lease(
+    datastore: DataStore, time_machine: TimeMachineFixture
+) -> None:
+    """
+    Test that a worker whose lease has expired cannot interfere with the worker that
+    subsequently acquired the same job:
+
+    * the stale worker's release must not delete the job, record a result, change the
+      running jobs counter or publish a JobReleased event
+    * the stale worker's lease extension must not prolong the new holder's lease
+    * the current holder's release must work normally, and releasing twice must not
+      decrement the counter or publish the event twice
+
+    """
+    await datastore.add_task(
+        Task(
+            id="task1",
+            func="contextlib:asynccontextmanager",
+            job_executor="async",
+            max_running_jobs=1,
+        )
+    )
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+
+    # Worker 1 acquires the job
+    time_machine.move_to(datetime.now(timezone.utc), tick=False)
+    acquired1 = await datastore.acquire_jobs("worker1", timedelta(seconds=30), 1)
+    assert len(acquired1) == 1
+    assert acquired1[0].lease_token is not None
+    assert (await datastore.get_task("task1")).running_jobs == 1
+
+    # The lease expires and worker 2 acquires the job
+    time_machine.shift(31)
+    acquired2 = await datastore.acquire_jobs("worker2", timedelta(seconds=30), 1)
+    assert len(acquired2) == 1
+    assert acquired2[0].id == job.id
+    assert acquired2[0].acquired_by == "worker2"
+    assert acquired2[0].lease_token != acquired1[0].lease_token
+    assert (await datastore.get_task("task1")).running_jobs == 1
+
+    async with capture_events(datastore, 0, {JobReleased}) as events:
+        # The stale release from worker 1 must not affect the new acquisition
+        await datastore.release_job(
+            "worker1",
+            acquired1[0],
+            JobResult.from_job(acquired1[0], JobOutcome.success, return_value="stale"),
+        )
+
+        # A stale lease extension from worker 1 must not extend the new lease either
+        await datastore.extend_acquired_job_leases(
+            "worker1", {job.id}, timedelta(seconds=90)
+        )
+
+        # The job must still be owned by worker 2, with its lease unextended
+        jobs = await datastore.get_jobs()
+        assert len(jobs) == 1
+        assert jobs[0].acquired_by == "worker2"
+        assert jobs[0].acquired_until == acquired2[0].acquired_until
+        assert (await datastore.get_task("task1")).running_jobs == 1
+        assert await datastore.get_job_result(job.id) is None
+        await anyio.wait_all_tasks_blocked()
+        assert events == []
+
+        # The current holder releases the job
+        await datastore.release_job(
+            "worker2",
+            acquired2[0],
+            JobResult.from_job(acquired2[0], JobOutcome.success, return_value="fresh"),
+        )
+
+        # Releasing the same job again must be a no-op
+        await datastore.release_job(
+            "worker2",
+            acquired2[0],
+            JobResult.from_job(acquired2[0], JobOutcome.success, return_value="fresh"),
+        )
+
+        assert not await datastore.get_jobs()
+        assert (await datastore.get_task("task1")).running_jobs == 0
+
+        # Exactly one result must have been recorded, with worker 2's return value
+        result = await datastore.get_job_result(job.id)
+        assert result
+        assert result.outcome is JobOutcome.success
+        assert result.return_value == "fresh"
+
+        # Exactly one JobReleased event must have been published
+        await anyio.wait_all_tasks_blocked()
+        assert len(events) == 1
+        assert events[0].job_id == job.id
+        assert events[0].scheduler_id == "worker2"
+        assert events[0].outcome is JobOutcome.success
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_release_job_after_lease_reacquired_by_same_scheduler(
+    datastore: DataStore, time_machine: TimeMachineFixture
+) -> None:
+    """
+    Test that when the same scheduler identity re-acquires a job after its previous
+    lease expired (e.g. after a restart or a lease refresh), a release tied to the old
+    lease does not affect the new acquisition.
+
+    """
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+
+    # The scheduler acquires the job
+    time_machine.move_to(datetime.now(timezone.utc), tick=False)
+    acquired1 = await datastore.acquire_jobs("worker1", timedelta(seconds=30), 1)
+    assert len(acquired1) == 1
+
+    # The lease expires and the same scheduler identity acquires the job again
+    time_machine.shift(31)
+    acquired2 = await datastore.acquire_jobs("worker1", timedelta(seconds=30), 1)
+    assert len(acquired2) == 1
+    assert acquired2[0].lease_token != acquired1[0].lease_token
+    assert (await datastore.get_task("task1")).running_jobs == 1
+
+    async with capture_events(datastore, 0, {JobReleased}) as events:
+        # A release tied to the old lease must be rejected, even though the scheduler
+        # identity matches
+        await datastore.release_job(
+            "worker1",
+            acquired1[0],
+            JobResult.from_job(acquired1[0], JobOutcome.success, return_value="stale"),
+        )
+
+        jobs = await datastore.get_jobs()
+        assert len(jobs) == 1
+        assert jobs[0].acquired_until == acquired2[0].acquired_until
+        assert (await datastore.get_task("task1")).running_jobs == 1
+        assert await datastore.get_job_result(job.id) is None
+        await anyio.wait_all_tasks_blocked()
+        assert events == []
+
+        # The release tied to the current lease must work
+        await datastore.release_job(
+            "worker1",
+            acquired2[0],
+            JobResult.from_job(acquired2[0], JobOutcome.success, return_value="fresh"),
+        )
+
+        assert not await datastore.get_jobs()
+        assert (await datastore.get_task("task1")).running_jobs == 0
+        result = await datastore.get_job_result(job.id)
+        assert result
+        assert result.return_value == "fresh"
+        await anyio.wait_all_tasks_blocked()
+        assert len(events) == 1
+
+
+async def test_release_job_without_lease(datastore: DataStore) -> None:
+    """Test that releasing a job that was never acquired is a no-op."""
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+
+    async with capture_events(datastore, 0, {JobReleased}) as events:
+        await datastore.release_job(
+            "worker1",
+            job,
+            JobResult.from_job(job, JobOutcome.success),
+        )
+
+        assert len(await datastore.get_jobs()) == 1
+        assert (await datastore.get_task("task1")).running_jobs == 0
+        assert await datastore.get_job_result(job.id) is None
+        await anyio.wait_all_tasks_blocked()
+        assert events == []
 
 
 async def test_add_get_task(datastore: DataStore) -> None:

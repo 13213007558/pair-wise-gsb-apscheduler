@@ -1230,4 +1230,7 @@ class AsyncScheduler:
             finally:
                 current_job.reset(token)
         finally:
-            self._running_jobs.remove(job)
+            # The same job may have been re-acquired (and thus be running in another
+            # task) if its lease expired in the meantime, so it may have already been
+            # removed from the set
+            self._running_jobs.discard(job)

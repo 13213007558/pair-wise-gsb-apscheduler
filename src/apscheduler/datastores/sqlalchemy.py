@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from logging import Logger
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import anyio
 import attrs
@@ -15,6 +15,7 @@ import tenacity
 from anyio import CancelScope, to_thread
 from attr.validators import instance_of
 from sqlalchemy import (
+    DDL,
     JSON,
     BigInteger,
     Boolean,
@@ -379,6 +380,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
             Column("created_at", timestamp_type, nullable=False, index=True),
             Column("acquired_by", Unicode(500), index=True),
             Column("acquired_until", timestamp_type),
+            Column("lease_token", Uuid),
         )
         Table(
             "job_results",
@@ -429,12 +431,25 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     version = result.scalar()
                     if version is None:
                         await self._execute(
-                            conn, self._t_metadata.insert(), {"schema_version": 1}
+                            conn, self._t_metadata.insert(), {"schema_version": 2}
                         )
-                    elif version > 1:
+                    elif version == 1:
+                        # Migrate to schema version 2: add the lease_token column
+                        column_type = Uuid().compile(dialect=self._engine.dialect)
+                        await self._execute(
+                            conn,
+                            DDL(
+                                f"ALTER TABLE {self._t_jobs.fullname} "
+                                f"ADD COLUMN lease_token {column_type}"
+                            ),
+                        )
+                        await self._execute(
+                            conn, self._t_metadata.update().values(schema_version=2)
+                        )
+                    elif version > 2:
                         raise RuntimeError(
                             f"Unexpected schema version ({version}); "
-                            f"only version 1 is supported by this version of "
+                            f"only versions 1-2 are supported by this version of "
                             f"APScheduler"
                         )
 
@@ -877,6 +892,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                 async with self._begin_transaction() as conn:
                     now = datetime.now(timezone.utc)
                     acquired_until = now + lease_duration
+                    lease_token = uuid4()
                     query = (
                         select(
                             self._t_jobs,
@@ -924,6 +940,12 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             task_job_slots_left.setdefault(
                                 row.task_id, task_max_running_jobs - task_running_jobs
                             )
+
+                        # If the job's previous lease had expired, reclaim the running
+                        # job slot from the previous holder
+                        if row.acquired_until is not None:
+                            running_job_count_increments[row.task_id] -= 1
+                            task_job_slots_left[row.task_id] += 1
 
                         # Deserialize the job
                         try:
@@ -973,6 +995,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         running_job_count_increments[job.task_id] += 1
                         job.acquired_by = scheduler_id
                         job.acquired_until = acquired_until
+                        job.lease_token = lease_token
                         acquired_jobs.append(job)
                         events.append(
                             JobAcquired.from_job(job, scheduler_id=scheduler_id)
@@ -984,13 +1007,16 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         update = (
                             self._t_jobs.update()
                             .values(
-                                acquired_by=scheduler_id, acquired_until=acquired_until
+                                acquired_by=scheduler_id,
+                                acquired_until=acquired_until,
+                                lease_token=lease_token,
                             )
                             .where(self._t_jobs.c.id.in_(acquired_job_ids))
                         )
                         await self._execute(conn, update)
 
-                        # Increment the running job counters on each task
+                    # Update the running job counters on each task
+                    if running_job_count_increments:
                         p_id: BindParameter = bindparam("p_id")
                         p_increment: BindParameter = bindparam("p_increment")
                         params = [
@@ -1069,11 +1095,46 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         )
 
     async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
+        if job.lease_token is None:
+            self._logger.info(
+                "Not releasing job %s: the job holds no valid lease", result.job_id
+            )
+            return
+
         async for attempt in self._retry():
             with attempt:
                 async with self._begin_transaction() as conn:
-                    event = await self._release_job(
-                        conn,
+                    # Delete the job, but only if the lease token still matches (that
+                    # is, the caller is still the current holder of the job's lease)
+                    delete = self._t_jobs.delete().where(
+                        self._t_jobs.c.id == result.job_id,
+                        self._t_jobs.c.lease_token == job.lease_token,
+                    )
+                    delete_result = await self._execute(conn, delete)
+                    if not delete_result.rowcount:
+                        self._logger.info(
+                            "Not releasing job %s: the lease held by %r is no longer "
+                            "valid",
+                            result.job_id,
+                            scheduler_id,
+                        )
+                        return
+
+                    # Record the job result
+                    if result.expires_at > result.finished_at:
+                        marshalled = result.marshal(self.serializer)
+                        insert = self._t_job_results.insert().values(**marshalled)
+                        await self._execute(conn, insert)
+
+                    # Decrement the number of running jobs for this task
+                    update = (
+                        self._t_tasks.update()
+                        .values(running_jobs=self._t_tasks.c.running_jobs - 1)
+                        .where(self._t_tasks.c.id == job.task_id)
+                    )
+                    await self._execute(conn, update)
+
+                    event = JobReleased.from_result(
                         result,
                         scheduler_id,
                         job.task_id,

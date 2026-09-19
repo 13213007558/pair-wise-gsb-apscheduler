@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from abc import ABCMeta, abstractmethod
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from contextlib import AsyncExitStack
 from datetime import datetime, timedelta
 from logging import Logger
@@ -337,6 +337,14 @@ class DataStore(metaclass=ABCMeta):
         """
         Release the claim on the given job and record the result.
 
+        The release must only take effect if the given scheduler still holds the
+        current claim on the job. Each successful acquisition establishes a new
+        claim (identified by the job's acquisition token) that supersedes any
+        older claims. A release arriving after the claim has expired and the job
+        has been acquired by another holder – as well as a duplicate release of
+        an already finished job – must be ignored without recording the result,
+        changing job counters or publishing events.
+
         :param scheduler_id: unique identifier of the scheduler
         :param job: the job to be released
         :param result: the result of the job
@@ -368,13 +376,17 @@ class DataStore(metaclass=ABCMeta):
 
     @abstractmethod
     async def extend_acquired_job_leases(
-        self, scheduler_id: str, job_ids: set[UUID], duration: timedelta
+        self, scheduler_id: str, jobs: Collection[Job], duration: timedelta
     ) -> None:
         """
-        Extend the leases of specified jobs acquired by the given scheduler.
+        Extend the leases of the specified jobs, but only on the claims still
+        held by the given scheduler as identified by the jobs' acquisition
+        tokens. A late lease extension must never affect a newer claim on the
+        same job, even when the scheduler identity has been reused after a
+        restart.
 
         :param scheduler_id: unique identifier of the scheduler
-        :param job_ids: the identifiers of the jobs the scheduler is running
+        :param jobs: the jobs the scheduler is running
         :param duration: the duration by which to extend the leases
         """
 

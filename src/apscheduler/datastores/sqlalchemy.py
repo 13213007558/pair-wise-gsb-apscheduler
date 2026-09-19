@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Collection, Iterable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from logging import Logger
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import anyio
 import attrs
@@ -48,6 +48,7 @@ from sqlalchemy.exc import (
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.future import Connection, Engine
 from sqlalchemy.schema import CreateSchema
+from sqlalchemy.sql.ddl import CreateColumn, DDL
 from sqlalchemy.sql import Executable
 from sqlalchemy.sql.ddl import DropTable
 from sqlalchemy.sql.elements import BindParameter, literal
@@ -379,6 +380,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
             Column("created_at", timestamp_type, nullable=False, index=True),
             Column("acquired_by", Unicode(500), index=True),
             Column("acquired_until", timestamp_type),
+            Column("acquired_token", Uuid),
         )
         Table(
             "job_results",
@@ -429,12 +431,31 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     version = result.scalar()
                     if version is None:
                         await self._execute(
-                            conn, self._t_metadata.insert(), {"schema_version": 1}
+                            conn, self._t_metadata.insert(), {"schema_version": 2}
                         )
-                    elif version > 1:
+                    elif version == 1:
+                        # Schema version 2 added the per-acquisition fence token on
+                        # jobs (used to reject late releases and lease extensions).
+                        column_ddl = str(
+                            CreateColumn(self._t_jobs.c.acquired_token).compile(
+                                dialect=self._engine.dialect
+                            )
+                        )
+                        await self._execute(
+                            conn,
+                            DDL(
+                                f"ALTER TABLE {self._t_jobs.fullname} ADD COLUMN "
+                                f"{column_ddl}"
+                            ),
+                        )
+                        await self._execute(
+                            conn,
+                            self._t_metadata.update().values(schema_version=2),
+                        )
+                    elif version > 2:
                         raise RuntimeError(
                             f"Unexpected schema version ({version}); "
-                            f"only version 1 is supported by this version of "
+                            f"only versions up to 2 are supported by this version of "
                             f"APScheduler"
                         )
 
@@ -910,19 +931,25 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
 
                     acquired_jobs: list[Job] = []
                     discarded_jobs: list[_JobDiscard] = []
+                    reset_job_ids: list[UUID] = []
                     task_job_slots_left: dict[str, float] = defaultdict(
                         lambda: float("inf")
                     )
-                    running_job_count_increments: dict[str, int] = defaultdict(
-                        lambda: 0
-                    )
+                    running_job_count_deltas: dict[str, int] = defaultdict(lambda: 0)
                     for row in result:
                         job_dict = row._asdict()
                         task_max_running_jobs = job_dict.pop("max_running_jobs")
                         task_running_jobs = job_dict.pop("running_jobs")
+                        expired_claim = row.acquired_until is not None
                         if task_max_running_jobs is not None:
+                            slot_adjustment = (
+                                task_running_jobs - 1
+                                if expired_claim
+                                else task_running_jobs
+                            )
                             task_job_slots_left.setdefault(
-                                row.task_id, task_max_running_jobs - task_running_jobs
+                                row.task_id,
+                                task_max_running_jobs - slot_adjustment,
                             )
 
                         # Deserialize the job
@@ -967,36 +994,67 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                 job.task_id,
                                 task_max_running_jobs,
                             )
+                            if expired_claim:
+                                # Revert the expired claim so the job appears
+                                # unclaimed while waiting for a free slot.
+                                reset_job_ids.append(job.id)
+                                running_job_count_deltas[job.task_id] -= 1
                             continue
 
                         task_job_slots_left[job.task_id] -= 1
-                        running_job_count_increments[job.task_id] += 1
+                        running_job_count_deltas[job.task_id] += (
+                            0 if expired_claim else 1
+                        )
+                        token = uuid4()
                         job.acquired_by = scheduler_id
                         job.acquired_until = acquired_until
+                        job.acquired_token = token
                         acquired_jobs.append(job)
                         events.append(
                             JobAcquired.from_job(job, scheduler_id=scheduler_id)
                         )
 
+                    # Reset claims on jobs skipped due to lack of slots
+                    if reset_job_ids:
+                        reset_update = (
+                            self._t_jobs.update()
+                            .values(
+                                acquired_by=None,
+                                acquired_until=None,
+                                acquired_token=None,
+                            )
+                            .where(self._t_jobs.c.id.in_(reset_job_ids))
+                        )
+                        await self._execute(conn, reset_update)
+
                     if acquired_jobs:
                         # Mark the acquired jobs as acquired by this worker
-                        acquired_job_ids = [job.id for job in acquired_jobs]
+                        p_token: BindParameter = bindparam("p_token")
+                        p_job_id: BindParameter = bindparam("p_job_id")
                         update = (
                             self._t_jobs.update()
                             .values(
-                                acquired_by=scheduler_id, acquired_until=acquired_until
+                                acquired_by=scheduler_id,
+                                acquired_until=acquired_until,
+                                acquired_token=p_token,
                             )
-                            .where(self._t_jobs.c.id.in_(acquired_job_ids))
+                            .where(self._t_jobs.c.id == p_job_id)
                         )
-                        await self._execute(conn, update)
-
-                        # Increment the running job counters on each task
-                        p_id: BindParameter = bindparam("p_id")
-                        p_increment: BindParameter = bindparam("p_increment")
                         params = [
-                            {"p_id": task_id, "p_increment": increment}
-                            for task_id, increment in running_job_count_increments.items()
+                            {"p_job_id": job.id, "p_token": job.acquired_token}
+                            for job in acquired_jobs
                         ]
+                        await self._execute(conn, update, params)
+
+                    # Adjust the running job counters on each task
+                    p_id: BindParameter = bindparam("p_id")
+                    p_increment: BindParameter = bindparam("p_increment")
+                    task_params = [
+                        {"p_id": task_id, "p_increment": increment}
+                        for task_id, increment in running_job_count_deltas.items()
+                        if increment
+                    ]
+                    if task_params:
                         update = (
                             self._t_tasks.update()
                             .values(
@@ -1004,7 +1062,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             )
                             .where(self._t_tasks.c.id == p_id)
                         )
-                        await self._execute(conn, update, params)
+                        await self._execute(conn, update, task_params)
 
                     # Discard the jobs that could not start
                     for discard in discarded_jobs:
@@ -1069,9 +1127,30 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         )
 
     async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
+        event: JobReleased | None = None
         async for attempt in self._retry():
             with attempt:
                 async with self._begin_transaction() as conn:
+                    # Only the current holder of the claim (identified by the
+                    # per-acquisition token) may release the job. A late release
+                    # from a holder that has lost its lease (or a duplicate release)
+                    # is ignored without touching the result, the counter or the
+                    # stored job.
+                    query = select(self._t_jobs.c.id).where(
+                        self._t_jobs.c.id == job.id,
+                        self._t_jobs.c.acquired_by == scheduler_id,
+                        self._t_jobs.c.acquired_token == job.acquired_token,
+                    )
+                    query = query.with_for_update(of=[self._t_jobs.c.acquired_token])
+                    if not (await self._execute(conn, query)).first():
+                        self._logger.debug(
+                            "Ignoring release of job %s from scheduler %r as it no "
+                            "longer holds the lease on that job",
+                            job.id,
+                            scheduler_id,
+                        )
+                        continue
+
                     event = await self._release_job(
                         conn,
                         result,
@@ -1082,7 +1161,8 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     )
 
         # Notify other schedulers
-        await self._event_broker.publish(event)
+        if event is not None:
+            await self._event_broker.publish(event)
 
     async def get_job_result(self, job_id: UUID) -> JobResult | None:
         async for attempt in self._retry():
@@ -1119,21 +1199,31 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     await self._execute(conn, update)
 
     async def extend_acquired_job_leases(
-        self, scheduler_id: str, job_ids: set[UUID], duration: timedelta
+        self, scheduler_id: str, jobs: Collection[Job], duration: timedelta
     ) -> None:
+        if not jobs:
+            return
+
         async for attempt in self._retry():
             with attempt:
                 async with self._begin_transaction() as conn:
                     new_acquired_until = datetime.now(timezone.utc) + duration
+                    p_job_id: BindParameter = bindparam("p_job_id")
+                    p_token: BindParameter = bindparam("p_token")
                     update = (
                         self._t_jobs.update()
                         .values(acquired_until=new_acquired_until)
                         .where(
                             self._t_jobs.c.acquired_by == scheduler_id,
-                            self._t_jobs.c.id.in_(job_ids),
+                            self._t_jobs.c.id == p_job_id,
+                            self._t_jobs.c.acquired_token == p_token,
                         )
                     )
-                    await self._execute(conn, update)
+                    params = [
+                        {"p_job_id": job.id, "p_token": job.acquired_token}
+                        for job in jobs
+                    ]
+                    await self._execute(conn, update, params)
 
     async def reap_abandoned_jobs(self, scheduler_id: str) -> None:
         query = (

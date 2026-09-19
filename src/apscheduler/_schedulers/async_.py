@@ -1120,9 +1120,9 @@ class AsyncScheduler:
         async def extend_job_leases() -> None:
             while self._state in (RunState.starting, RunState.started):
                 await sleep(self.lease_duration.total_seconds() / 2)
-                if job_ids := {job.id for job in self._running_jobs}:
+                if self._running_jobs:
                     await self.data_store.extend_acquired_job_leases(
-                        self.identity, job_ids, self.lease_duration
+                        self.identity, list(self._running_jobs), self.lease_duration
                     )
 
         # If there are any jobs marked as being acquired by this scheduler, release them

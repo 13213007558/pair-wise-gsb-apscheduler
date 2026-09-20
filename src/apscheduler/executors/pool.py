@@ -12,7 +12,7 @@ class BasePoolExecutor(BaseExecutor):
         super().__init__()
         self._pool = pool
 
-    def _do_submit_job(self, job, run_times):
+    def _do_submit_job(self, job, run_times, token):
         def callback(f):
             exc, tb = (
                 f.exception_info()
@@ -20,9 +20,9 @@ class BasePoolExecutor(BaseExecutor):
                 else (f.exception(), getattr(f.exception(), "__traceback__", None))
             )
             if exc:
-                self._run_job_error(job.id, exc, tb)
+                self._job_failed(token, exc, tb)
             else:
-                self._run_job_success(job.id, f.result())
+                self._job_succeeded(token, f.result())
 
         f = self._pool.submit(
             run_job, job, job._jobstore_alias, run_times, self._logger.name
@@ -69,9 +69,9 @@ class ProcessPoolExecutor(BasePoolExecutor):
         )
         super().__init__(pool)
 
-    def _do_submit_job(self, job, run_times):
+    def _do_submit_job(self, job, run_times, token):
         try:
-            super()._do_submit_job(job, run_times)
+            super()._do_submit_job(job, run_times, token)
         except BrokenProcessPool:
             self._logger.warning(
                 "Process pool is broken; replacing pool with a fresh instance"
@@ -79,4 +79,4 @@ class ProcessPoolExecutor(BasePoolExecutor):
             self._pool = self._pool.__class__(
                 self._pool._max_workers, **self.pool_kwargs
             )
-            super()._do_submit_job(job, run_times)
+            super()._do_submit_job(job, run_times, token)

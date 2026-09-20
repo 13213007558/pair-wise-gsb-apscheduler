@@ -27,14 +27,14 @@ class TornadoExecutor(BaseExecutor):
         super().start(scheduler, alias)
         self._ioloop = scheduler._ioloop
 
-    def _do_submit_job(self, job, run_times):
+    def _do_submit_job(self, job, run_times, token):
         def callback(f):
             try:
                 events = f.result()
             except BaseException:
-                self._run_job_error(job.id, *sys.exc_info()[1:])
+                self._job_failed(token, *sys.exc_info()[1:])
             else:
-                self._run_job_success(job.id, events)
+                self._job_succeeded(token, events)
 
         if iscoroutinefunction_partial(job.func):
             f = run_coroutine_job(

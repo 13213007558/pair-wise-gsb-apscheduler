@@ -11,6 +11,7 @@ import pytz
 
 from apscheduler.util import (
     asbool,
+    ascoalesce,
     asint,
     astimezone,
     check_callable_args,
@@ -103,6 +104,38 @@ class TestAsbool:
 
     def test_bad_value(self):
         pytest.raises(ValueError, asbool, "yep")
+
+
+class TestAscoalesce:
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            ("earliest", "earliest"),
+            (" Latest ", "latest"),
+            ("ALL", "all"),
+            (True, "latest"),
+            (False, "all"),
+            ("true", "latest"),
+            ("false", "all"),
+        ],
+        ids=[
+            "earliest",
+            "latest-padded",
+            "all-uppercase",
+            "True",
+            "False",
+            "string-true",
+            "string-false",
+        ],
+    )
+    def test_valid_values(self, value, expected):
+        assert ascoalesce(value) == expected
+
+    def test_bad_string(self):
+        pytest.raises(ValueError, ascoalesce, "sometimes")
+
+    def test_bad_type(self):
+        pytest.raises(TypeError, ascoalesce, 1)
 
 
 class TestAstimezone:

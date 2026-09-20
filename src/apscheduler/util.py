@@ -3,6 +3,7 @@
 __all__ = (
     "asint",
     "asbool",
+    "ascoalesce",
     "astimezone",
     "convert_to_datetime",
     "datetime_to_utc_timestamp",
@@ -82,6 +83,36 @@ def asbool(obj):
         raise ValueError(f'Unable to interpret value "{obj}" as boolean')
 
     return bool(obj)
+
+
+def ascoalesce(obj):
+    """
+    Interprets an object as a coalesce policy.
+
+    Accepts the policy names ``"earliest"``, ``"latest"`` and ``"all"`` (case
+    insensitively), along with the legacy boolean values where ``True`` is equivalent to
+    ``"latest"`` and ``False`` is equivalent to ``"all"``. Boolean-like strings (such as
+    ``"true"`` and ``"false"``) are interpreted like the corresponding booleans.
+
+    :raises TypeError: if the value is neither a string nor a boolean
+    :raises ValueError: if the string does not name a policy or a boolean value
+    :rtype: str
+
+    """
+    if isinstance(obj, str):
+        value = obj.strip().lower()
+        if value in ("earliest", "latest", "all"):
+            return value
+
+        return "latest" if asbool(obj) else "all"
+
+    if isinstance(obj, bool):
+        return "latest" if obj else "all"
+
+    raise TypeError(
+        'coalesce must be a boolean or one of the strings "earliest", "latest" or '
+        f'"all", got {obj.__class__.__name__} instead'
+    )
 
 
 def astimezone(obj):

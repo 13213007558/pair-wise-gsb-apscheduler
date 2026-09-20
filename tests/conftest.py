@@ -63,7 +63,18 @@ def freeze_time(monkeypatch, timezone):
             self.increment = delta
 
     freezer = TimeFreezer(localize(datetime(2011, 4, 3, 18, 40), timezone))
-    fake_datetime = Mock(datetime, now=freezer.get)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tzinfo=None):
+            return freezer.get(tzinfo)
+
+        @classmethod
+        def fromtimestamp(cls, timestamp, tz=None):
+            # Return a plain datetime so that frozen times remain picklable
+            return datetime.fromtimestamp(timestamp, tz)
+
+    fake_datetime = FrozenDateTime
     monkeypatch.setattr("apscheduler.schedulers.base.datetime", fake_datetime)
     monkeypatch.setattr("apscheduler.executors.base.datetime", fake_datetime)
     monkeypatch.setattr("apscheduler.triggers.interval.datetime", fake_datetime)

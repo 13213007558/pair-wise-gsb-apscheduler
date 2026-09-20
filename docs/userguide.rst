@@ -421,9 +421,31 @@ scheduler) to see if the execution should still be triggered. This can lead into
 executed several times in succession.
 
 If this behavior is undesirable for your particular use case, it is possible to use ``coalescing`` to
-roll all these missed executions into one. In other words, if coalescing is enabled for the job and
-the scheduler sees one or more queued executions for the job, it will only trigger it once. No
-misfire events will be sent for the "bypassed" runs.
+roll some or all of these missed executions into one. The ``coalesce`` option (which can be set
+per job via :meth:`~apscheduler.schedulers.base.BaseScheduler.add_job` and
+:meth:`~apscheduler.schedulers.base.BaseScheduler.modify_job`, or globally in the scheduler's
+``job_defaults``) accepts one of three policies:
+
+* ``"earliest"``: only the earliest queued execution is run. Use this when the job should catch
+  up from where it left off, but running it more than once is pointless.
+* ``"latest"``: only the latest queued execution is run. Use this when only the most recent
+  result matters. This is the default policy.
+* ``"all"``: every queued execution is run, in chronological order. Use this when no scheduled
+  run may be skipped.
+
+For example, if a job is scheduled to run at 09:00, 09:10 and 09:20 and the scheduler only gets
+to process it at 09:25, then ``"earliest"`` runs the 09:00 execution, ``"latest"`` runs the
+09:20 execution and ``"all"`` runs all three executions in order. In every case the next
+scheduled run time afterwards is 09:30 -- the policy only affects which of the already missed
+run times are submitted, never the future schedule.
+
+For backwards compatibility, the option also accepts booleans: ``True`` is equivalent to
+``"latest"`` and ``False`` is equivalent to ``"all"``. Any other value is rejected.
+
+The ``misfire_grace_time`` check is applied to each selected execution against its original
+scheduled run time, so executions selected by the policy can still be skipped (and reported as
+misfired) if they are too old. No misfire events are sent for the executions that the policy
+did not select.
 
 .. note::
     If the execution of a job is delayed due to no threads or processes being available in the

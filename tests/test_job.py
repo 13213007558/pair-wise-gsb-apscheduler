@@ -223,7 +223,7 @@ def test_getstate(job):
         kwargs={},
         id=b"t\xc3\xa9st\xc3\xafd".decode("utf-8"),
         misfire_grace_time=1,
-        coalesce=False,
+        coalesce="all",
         max_instances=1,
         next_run_time=None,
     )
@@ -257,9 +257,39 @@ def test_setstate(job, timezone):
     assert job.kwargs == {}
     assert job.name == "testjob.dummyfunc"
     assert job.misfire_grace_time == 2
-    assert job.coalesce is True
+    assert job.coalesce == "latest"
     assert job.max_instances == 2
     assert job.next_run_time is None
+
+
+@pytest.mark.parametrize("legacy_value, expected", [(True, "latest"), (False, "all")])
+def test_setstate_legacy_boolean_coalesce(job, timezone, legacy_value, expected):
+    """Tests that jobs serialized with boolean coalesce values still load."""
+    state = dict(
+        version=1,
+        trigger=DateTrigger("2010-12-14 13:05:00", timezone),
+        executor="dummyexecutor",
+        func="tests.test_job:dummyfunc",
+        name="testjob.dummyfunc",
+        args=[],
+        kwargs={},
+        id="other_id",
+        misfire_grace_time=2,
+        coalesce=legacy_value,
+        max_instances=2,
+        next_run_time=None,
+    )
+    job.__setstate__(state)
+    assert job.coalesce == expected
+
+    # The state must round-trip in the canonical (string) form
+    assert job.__getstate__()["coalesce"] == expected
+
+
+def test_modify_invalid_coalesce(job):
+    """Tests that invalid coalesce values are explicitly rejected."""
+    pytest.raises(ValueError, job._modify, coalesce="sometimes")
+    pytest.raises(TypeError, job._modify, coalesce=123)
 
 
 def test_setstate_bad_version(job):

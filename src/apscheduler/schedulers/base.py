@@ -41,7 +41,7 @@ from apscheduler.schedulers import (
 )
 from apscheduler.triggers.base import BaseTrigger
 from apscheduler.util import (
-    asbool,
+    ascoalesce,
     asint,
     astimezone,
     maybe_ref,
@@ -469,8 +469,11 @@ class BaseScheduler(metaclass=ABCMeta):
         :param str|unicode name: textual description of the job
         :param int misfire_grace_time: seconds after the designated runtime that the job is still
             allowed to be run (or ``None`` to allow the job to run no matter how late it is)
-        :param bool coalesce: run once instead of many times if the scheduler determines that the
-            job should be run more than once in succession
+        :param bool|str coalesce: the coalescing policy to apply when the scheduler determines
+            that the job should be run more than once in succession: ``"earliest"`` runs only
+            the earliest missed run time, ``"latest"`` runs only the latest one and
+            ``"all"`` runs all of them in chronological order. For backwards compatibility,
+            ``True`` is equivalent to ``"latest"`` and ``False`` to ``"all"``.
         :param int max_instances: maximum number of concurrently running instances allowed for this
             job
         :param datetime next_run_time: when to first run the job, regardless of the trigger (pass
@@ -907,7 +910,7 @@ class BaseScheduler(metaclass=ABCMeta):
         job_defaults = config.get("job_defaults", {})
         self._job_defaults = {
             "misfire_grace_time": asint(job_defaults.get("misfire_grace_time", 1)),
-            "coalesce": asbool(job_defaults.get("coalesce", True)),
+            "coalesce": ascoalesce(job_defaults.get("coalesce", True)),
             "max_instances": asint(job_defaults.get("max_instances", 1)),
         }
 
@@ -1187,12 +1190,20 @@ class BaseScheduler(metaclass=ABCMeta):
                         continue
 
                     run_times = job._get_run_times(now)
-                    run_times = (
-                        run_times[-1:] if run_times and job.coalesce else run_times
-                    )
                     if run_times:
+                        # Select which of the due run times to actually submit, based on
+                        # the job's coalescing policy. The full list is retained for
+                        # computing the next run time so that no due run time is ever
+                        # considered again on the next round.
+                        if job.coalesce == "earliest":
+                            submitted_run_times = run_times[:1]
+                        elif job.coalesce == "latest":
+                            submitted_run_times = run_times[-1:]
+                        else:
+                            submitted_run_times = run_times
+
                         try:
-                            executor.submit_job(job, run_times)
+                            executor.submit_job(job, submitted_run_times)
                         except MaxInstancesReachedError:
                             self._logger.warning(
                                 'Execution of job "%s" skipped: maximum number of running '
@@ -1204,7 +1215,7 @@ class BaseScheduler(metaclass=ABCMeta):
                                 EVENT_JOB_MAX_INSTANCES,
                                 job.id,
                                 jobstore_alias,
-                                run_times,
+                                submitted_run_times,
                             )
                             events.append(event)
                         except BaseException:
@@ -1215,7 +1226,10 @@ class BaseScheduler(metaclass=ABCMeta):
                             )
                         else:
                             event = JobSubmissionEvent(
-                                EVENT_JOB_SUBMITTED, job.id, jobstore_alias, run_times
+                                EVENT_JOB_SUBMITTED,
+                                job.id,
+                                jobstore_alias,
+                                submitted_run_times,
                             )
                             events.append(event)
 

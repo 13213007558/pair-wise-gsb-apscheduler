@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from apscheduler.triggers.base import BaseTrigger
 from apscheduler.util import (
+    ascoalesce,
     check_callable_args,
     convert_to_datetime,
     datetime_repr,
@@ -23,7 +24,11 @@ class Job:
     :var func: the callable to execute
     :var tuple|list args: positional arguments to the callable
     :var dict kwargs: keyword arguments to the callable
-    :var bool coalesce: whether to only run the job once when several run times are due
+    :var str coalesce: the coalescing policy that determines which of the missed run times
+        are submitted when several run times are due at once: ``"earliest"`` (only the
+        earliest one), ``"latest"`` (only the latest one) or ``"all"`` (all of them, in
+        chronological order). The legacy booleans ``True`` and ``False`` are accepted as
+        aliases for ``"latest"`` and ``"all"`` respectively.
     :var trigger: the trigger object that controls the schedule of this job
     :var str executor: the name of the executor that will run this job
     :var int misfire_grace_time: the time (in seconds) how much this job's execution is allowed to
@@ -214,8 +219,8 @@ class Job:
             approved["misfire_grace_time"] = value
 
         if "coalesce" in changes:
-            value = bool(changes.pop("coalesce"))
-            approved["coalesce"] = value
+            value = changes.pop("coalesce")
+            approved["coalesce"] = ascoalesce(value)
 
         if "max_instances" in changes:
             value = changes.pop("max_instances")
@@ -305,7 +310,8 @@ class Job:
         self.kwargs = state["kwargs"]
         self.name = state["name"]
         self.misfire_grace_time = state["misfire_grace_time"]
-        self.coalesce = state["coalesce"]
+        # Legacy serialized jobs may carry a boolean coalesce value
+        self.coalesce = ascoalesce(state["coalesce"])
         self.max_instances = state["max_instances"]
         self.next_run_time = state["next_run_time"]
 

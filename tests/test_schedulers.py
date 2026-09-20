@@ -1330,3 +1330,51 @@ class TestQtScheduler(SchedulerImplementationTestBase):
         while queue.empty():
             QCoreApplication.processEvents()
         return queue.get_nowait()
+
+
+def test_same_job_id_in_different_jobstores_runs_concurrently():
+    """
+    Regression test: two jobs with the same ID living in different job stores must
+    not share the max_instances quota of their shared executor.
+    """
+    from threading import Event
+
+    from apscheduler.schedulers.background import BackgroundScheduler
+
+    started = [Event(), Event()]
+    release = Event()
+    finished = [Event(), Event()]
+
+    def job_func(index):
+        started[index].set()
+        release.wait(10)
+        finished[index].set()
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_jobstore("memory", "store2")
+    for index, jobstore in enumerate(("default", "store2")):
+        scheduler.add_job(
+            job_func,
+            "date",
+            args=[index],
+            id="refresh",
+            jobstore=jobstore,
+            max_instances=1,
+            run_date=datetime.now(timezone.utc),
+        )
+
+    scheduler.start()
+    try:
+        # Both jobs must start even though the first one is still running
+        assert started[0].wait(10)
+        assert started[1].wait(10)
+        release.set()
+        assert finished[0].wait(10)
+        assert finished[1].wait(10)
+    finally:
+        release.set()
+        scheduler.shutdown()
+
+    # The instance counts must have been fully released on both job stores
+    executor = scheduler._executors["default"]
+    assert dict(executor._instances) == {}

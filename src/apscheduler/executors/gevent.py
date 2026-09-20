@@ -20,9 +20,9 @@ class GeventExecutor(BaseExecutor):
             try:
                 events = greenlet.get()
             except BaseException:
-                self._run_job_error(job.id, *sys.exc_info()[1:])
+                self._run_job_error(job._jobstore_alias, job.id, *sys.exc_info()[1:])
             else:
-                self._run_job_success(job.id, events)
+                self._run_job_success(job._jobstore_alias, job.id, events)
 
         gevent.spawn(
             run_job, job, job._jobstore_alias, run_times, self._logger.name

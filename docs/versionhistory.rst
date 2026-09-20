@@ -18,6 +18,9 @@ APScheduler, see the :doc:`migration section <migration>`.
   leading to the scheduler not working at all
 - Fixed ``ProcessPoolExecutor`` not respecting the passed keyword arguments when a
   broken pool was being replaced
+- Fixed jobs with the same ID in different job stores sharing the ``max_instances``
+  quota of a shared executor; running instance counts are now tracked per
+  job store and job ID
 
 **3.10.4**
 

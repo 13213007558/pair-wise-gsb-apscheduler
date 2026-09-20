@@ -68,36 +68,39 @@ class BaseExecutor(metaclass=ABCMeta):
         """
         assert self._lock is not None, "This executor has not been started yet"
         with self._lock:
-            if self._instances[job.id] >= job.max_instances:
+            key = (job._jobstore_alias, job.id)
+            if self._instances[key] >= job.max_instances:
                 raise MaxInstancesReachedError(job)
 
             self._do_submit_job(job, run_times)
-            self._instances[job.id] += 1
+            self._instances[key] += 1
 
     @abstractmethod
     def _do_submit_job(self, job, run_times):
         """Performs the actual task of scheduling `run_job` to be called."""
 
-    def _run_job_success(self, job_id, events):
+    def _run_job_success(self, jobstore_alias, job_id, events):
         """
         Called by the executor with the list of generated events when :func:`run_job` has been
         successfully called.
 
         """
         with self._lock:
-            self._instances[job_id] -= 1
-            if self._instances[job_id] == 0:
-                del self._instances[job_id]
+            key = (jobstore_alias, job_id)
+            self._instances[key] -= 1
+            if self._instances[key] == 0:
+                del self._instances[key]
 
         for event in events:
             self._scheduler._dispatch_event(event)
 
-    def _run_job_error(self, job_id, exc, traceback=None):
+    def _run_job_error(self, jobstore_alias, job_id, exc, traceback=None):
         """Called by the executor with the exception if there is an error  calling `run_job`."""
         with self._lock:
-            self._instances[job_id] -= 1
-            if self._instances[job_id] == 0:
-                del self._instances[job_id]
+            key = (jobstore_alias, job_id)
+            self._instances[key] -= 1
+            if self._instances[key] == 0:
+                del self._instances[key]
 
         exc_info = (exc.__class__, exc, traceback)
         self._logger.error("Error running job %s", job_id, exc_info=exc_info)

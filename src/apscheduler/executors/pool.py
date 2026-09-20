@@ -20,9 +20,9 @@ class BasePoolExecutor(BaseExecutor):
                 else (f.exception(), getattr(f.exception(), "__traceback__", None))
             )
             if exc:
-                self._run_job_error(job.id, exc, tb)
+                self._run_job_error(job._jobstore_alias, job.id, exc, tb)
             else:
-                self._run_job_success(job.id, f.result())
+                self._run_job_success(job._jobstore_alias, job.id, f.result())
 
         f = self._pool.submit(
             run_job, job, job._jobstore_alias, run_times, self._logger.name

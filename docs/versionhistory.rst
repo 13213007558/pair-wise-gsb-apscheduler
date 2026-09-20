@@ -6,6 +6,12 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **3.11.0**
 
+- Added ``AsyncIOScheduler.shutdown_async()`` and
+  ``AsyncIOExecutor.shutdown_async()``, awaitable shutdown entry points that stop
+  new job submissions, wait for pending coroutine and thread pool jobs without
+  blocking the event loop, cancel coroutine jobs (awaiting their cleanup) on a
+  caller-supplied timeout and honestly report thread pool jobs that are still
+  running
 - Dropped support for Python 3.6 and 3.7
 - Added support for ``ZoneInfo`` time zones and deprecated support for pytz time zones
 - Added ``CalendarIntervalTrigger``, backported from the 4.x series

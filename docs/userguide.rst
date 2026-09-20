@@ -377,6 +377,37 @@ executing jobs are finished. If you don't want to wait, you can do::
 This will still shut down the job stores and executors but does not wait for any running
 tasks to complete.
 
+Shutting down asynchronously
+----------------------------
+
+When using :class:`~apscheduler.schedulers.asyncio.AsyncIOScheduler` inside an
+asynchronous application (for example from an ASGI lifespan handler), the synchronous
+:meth:`~apscheduler.schedulers.base.BaseScheduler.shutdown` cannot wait for jobs
+to finish, because blocking would freeze the event loop. For that case there is an
+awaitable counterpart::
+
+    still_running = await scheduler.shutdown_async(timeout=10)
+
+It works as follows:
+
+#. The wakeup timer is stopped and executors stop accepting new job submissions.
+#. Jobs already running are awaited without blocking the event loop. Jobs that
+   finish within ``timeout`` dispatch their success/error events as usual.
+#. If the timeout expires, pending coroutine jobs are cancelled and their cleanup
+   (such as ``finally`` blocks) is awaited before resources are torn down.
+#. Jobs running in worker threads cannot be cancelled or killed. They are logged
+   and returned to the caller in the result (a dict of executor alias to a list of
+   still-running futures); they are **not** reported as cancelled.
+#. Only then are the job stores shut down and the shutdown event dispatched.
+
+Concurrent and repeated calls share the same shutdown process; once it has
+completed, further calls return the same result immediately. Starting the scheduler
+while a shutdown is in progress raises
+:class:`~apscheduler.schedulers.SchedulerAlreadyRunningError`.
+
+See the ``examples/schedulers/asyncio_asgi_lifespan.py`` example for how to use
+this in an ASGI (FastAPI/Starlette) lifespan.
+
 
 Pausing/resuming job processing
 -------------------------------

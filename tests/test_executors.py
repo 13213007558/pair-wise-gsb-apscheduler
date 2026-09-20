@@ -309,3 +309,73 @@ async def test_asyncio_executor_shutdown(asyncio_scheduler, asyncio_executor):
     asyncio_executor.shutdown()
     with pytest.raises(CancelledError):
         await futures.pop()
+
+
+@pytest.mark.anyio
+async def test_asyncio_executor_shutdown_async(asyncio_scheduler, asyncio_executor):
+    """Test that shutdown_async() waits for pending coroutine jobs to finish."""
+    from asyncio import sleep
+
+    job = asyncio_scheduler.add_job(waiter, "interval", seconds=1, args=[sleep, None])
+    asyncio_executor.submit_job(job, [datetime.now(utc)])
+
+    still_running = await asyncio_executor.shutdown_async(timeout=5)
+    assert still_running == []
+    assert not asyncio_executor._pending_futures
+
+
+@pytest.mark.anyio
+async def test_asyncio_executor_shutdown_async_shared_callers(
+    asyncio_scheduler, asyncio_executor
+):
+    """Test that concurrent shutdown_async() calls share one shutdown process."""
+    from asyncio import gather, sleep
+
+    job = asyncio_scheduler.add_job(waiter, "interval", seconds=1, args=[sleep, None])
+    asyncio_executor.submit_job(job, [datetime.now(utc)])
+
+    results = await gather(
+        asyncio_executor.shutdown_async(), asyncio_executor.shutdown_async()
+    )
+    assert results[0] == []
+    assert results[0] is results[1]
+
+
+@pytest.mark.anyio
+async def test_asyncio_executor_shutdown_async_rejects_submissions(
+    asyncio_scheduler, asyncio_executor
+):
+    """Test that the executor rejects new jobs once shutdown has begun."""
+    from asyncio import sleep
+
+    await asyncio_executor.shutdown_async()
+    job = asyncio_scheduler.add_job(waiter, "interval", seconds=1, args=[sleep, None])
+    with pytest.raises(RuntimeError, match="no longer accepts new jobs"):
+        asyncio_executor.submit_job(job, [datetime.now(utc)])
+
+
+@pytest.mark.anyio
+async def test_asyncio_executor_shutdown_async_reports_running_thread_jobs(
+    asyncio_scheduler, asyncio_executor
+):
+    """Test that uncancellable thread pool jobs are reported, not claimed cancelled."""
+    from asyncio import sleep
+
+    started = Event()
+    release = Event()
+
+    def blocker():
+        started.set()
+        release.wait(30)
+
+    job = asyncio_scheduler.add_job(blocker, "interval", seconds=3600)
+    asyncio_executor.submit_job(job, [datetime.now(utc)])
+    while not started.is_set():
+        await sleep(0.01)
+
+    try:
+        still_running = await asyncio_executor.shutdown_async(timeout=0.1)
+        assert len(still_running) == 1
+        assert not still_running[0].done()
+    finally:
+        release.set()

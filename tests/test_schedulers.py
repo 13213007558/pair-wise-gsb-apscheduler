@@ -43,7 +43,9 @@ from apscheduler.schedulers import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.schedulers.base import STATE_RUNNING, STATE_STOPPED, BaseScheduler
 from apscheduler.triggers.base import BaseTrigger
-from apscheduler.util import undefined
+from apscheduler.triggers.combining import OrTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.util import localize, undefined
 
 
 class DummyScheduler(BaseScheduler):
@@ -1132,6 +1134,97 @@ class TestProcessJobs:
         }
 
         assert scheduler._process_jobs() == 5
+
+
+class TestOrTriggerIndependentCursors:
+    @pytest.fixture
+    def scheduler(self, timezone):
+        scheduler = DummyScheduler()
+        scheduler.add_executor(DebugExecutor())
+        scheduler.start()
+        return scheduler
+
+    @pytest.fixture
+    def now_controller(self, monkeypatch, timezone):
+        class NowController:
+            def __init__(self):
+                self.current = localize(datetime(2011, 4, 3, 18, 40), timezone)
+
+            def get(self, tzinfo=None):
+                if tzinfo:
+                    return self.current.astimezone(tzinfo)
+                return self.current.replace(tzinfo=None)
+
+            def set(self, new_time):
+                self.current = new_time
+
+        controller = NowController()
+        fake_datetime = MagicMock(wraps=datetime, now=controller.get)
+        monkeypatch.setattr("apscheduler.schedulers.base.datetime", fake_datetime)
+        monkeypatch.setattr("apscheduler.executors.base.datetime", fake_datetime)
+        return controller
+
+    @pytest.fixture
+    def submitted_events(self, scheduler):
+        events = []
+        scheduler.add_listener(events.append, EVENT_JOB_SUBMITTED)
+        return events
+
+    @staticmethod
+    def add_intervals_job(scheduler, timezone, start, coalesce):
+        trigger = OrTrigger(
+            [
+                IntervalTrigger(minutes=5, start_date=start, timezone=timezone),
+                IntervalTrigger(minutes=7, start_date=start, timezone=timezone),
+            ],
+            independent_cursors=True,
+        )
+        return scheduler.add_job(lambda: None, trigger=trigger, coalesce=coalesce)
+
+    @staticmethod
+    def run_times(events):
+        return [run_time for event in events for run_time in event.scheduled_run_times]
+
+    @pytest.mark.parametrize("coalesce", [True, False], ids=["coalesce", "nocoalesce"])
+    def test_run_times(
+        self, scheduler, submitted_events, now_controller, timezone, coalesce
+    ):
+        """The job runs on the interleaved schedule of both interval triggers."""
+        start = now_controller.current
+        self.add_intervals_job(scheduler, timezone, start, coalesce)
+        for _ in range(36):
+            now_controller.set(now_controller.current + timedelta(minutes=1))
+            scheduler._process_jobs()
+
+        expected_offsets = (0, 5, 7, 10, 14, 15, 20, 21, 25, 28, 30, 35)
+        expected = [start + timedelta(minutes=offset) for offset in expected_offsets]
+        assert self.run_times(submitted_events) == expected
+
+    @pytest.mark.parametrize("coalesce", [True, False], ids=["coalesce", "nocoalesce"])
+    def test_missed_run_times(
+        self, scheduler, submitted_events, now_controller, timezone, coalesce
+    ):
+        """Missed fire times are coalesced or all run, then the schedule goes on."""
+        start = now_controller.current
+        job = self.add_intervals_job(scheduler, timezone, start, coalesce)
+
+        # Simulate the scheduler being unable to run the job for 31 minutes
+        now_controller.set(start + timedelta(minutes=31))
+        scheduler._process_jobs()
+
+        missed_offsets = (0, 5, 7, 10, 14, 15, 20, 21, 25, 28, 30)
+        if coalesce:
+            expected = [start + timedelta(minutes=30)]
+        else:
+            expected = [start + timedelta(minutes=offset) for offset in missed_offsets]
+
+        assert self.run_times(submitted_events) == expected
+
+        # The schedule continues from where it left off, without repeats or gaps
+        now_controller.set(start + timedelta(minutes=36))
+        scheduler._process_jobs()
+        assert self.run_times(submitted_events)[-1] == start + timedelta(minutes=35)
+        assert job.next_run_time == start + timedelta(minutes=40)
 
 
 class SchedulerImplementationTestBase:

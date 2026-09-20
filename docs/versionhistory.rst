@@ -7,6 +7,8 @@ APScheduler, see the :doc:`migration section <migration>`.
 **3.11.0**
 
 - Dropped support for Python 3.6 and 3.7
+- Added the ``independent_cursors`` option to ``OrTrigger`` which lets each combined
+  trigger advance on its own schedule (useful when combining interval triggers)
 - Added support for ``ZoneInfo`` time zones and deprecated support for pytz time zones
 - Added ``CalendarIntervalTrigger``, backported from the 4.x series
 - Added the ability to export and import jobs via ``scheduler.export_jobs()`` and

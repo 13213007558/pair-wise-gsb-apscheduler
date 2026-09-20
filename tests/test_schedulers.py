@@ -18,6 +18,7 @@ from apscheduler.events import (
     EVENT_EXECUTOR_ADDED,
     EVENT_EXECUTOR_REMOVED,
     EVENT_JOB_ADDED,
+    EVENT_JOB_ERROR,
     EVENT_JOB_EXECUTED,
     EVENT_JOB_MAX_INSTANCES,
     EVENT_JOB_MODIFIED,
@@ -1242,6 +1243,212 @@ class TestAsyncIOScheduler(SchedulerImplementationTestBase):
         event_loop.call_soon_threadsafe(event_loop.stop)
         thread.join()
         event_loop.close()
+
+
+class TestAsyncIOSchedulerAsyncShutdown:
+    """Tests for AsyncIOScheduler.async_shutdown()."""
+
+    @pytest.mark.anyio
+    async def test_not_running(self):
+        scheduler = AsyncIOScheduler()
+        with pytest.raises(SchedulerNotRunningError):
+            await scheduler.async_shutdown()
+
+    @pytest.mark.anyio
+    async def test_no_jobs_and_repeated_calls(self):
+        scheduler = AsyncIOScheduler()
+        scheduler.start(paused=True)
+        events = []
+        scheduler.add_listener(events.append, EVENT_ALL)
+
+        result = await scheduler.async_shutdown(timeout=5)
+
+        assert result == []
+        assert scheduler.state == STATE_STOPPED
+        shutdown_events = [e for e in events if e.code == EVENT_SCHEDULER_SHUTDOWN]
+        assert len(shutdown_events) == 1
+
+        # Repeated calls share the completed shutdown and return the same result
+        assert await scheduler.async_shutdown() is result
+        shutdown_events = [e for e in events if e.code == EVENT_SCHEDULER_SHUTDOWN]
+        assert len(shutdown_events) == 1
+
+    @pytest.mark.anyio
+    async def test_waits_for_job_and_event_loop_stays_alive(self):
+        scheduler = AsyncIOScheduler()
+        job_started = asyncio.Event()
+        heartbeat = asyncio.Event()
+
+        async def jobfunc():
+            job_started.set()
+            await asyncio.sleep(0.3)
+
+        scheduler.add_job(jobfunc, "date", run_date=datetime.now(timezone.utc))
+        scheduler.start()
+        events = []
+        scheduler.add_listener(events.append, EVENT_ALL)
+
+        await asyncio.wait_for(job_started.wait(), 5)
+        # A heartbeat scheduled during the shutdown must still run, proving that
+        # async_shutdown() does not block the event loop
+        scheduler._eventloop.call_later(0.1, heartbeat.set)
+        result = await scheduler.async_shutdown(timeout=5)
+
+        assert result == []
+        assert heartbeat.is_set()
+        assert scheduler.state == STATE_STOPPED
+        assert EVENT_JOB_EXECUTED in [event.code for event in events]
+
+    @pytest.mark.anyio
+    async def test_dispatches_error_events(self):
+        scheduler = AsyncIOScheduler()
+        job_started = asyncio.Event()
+
+        async def jobfunc():
+            job_started.set()
+            raise ValueError("boom")
+
+        scheduler.add_job(jobfunc, "date", run_date=datetime.now(timezone.utc))
+        scheduler.start()
+        events = []
+        scheduler.add_listener(events.append, EVENT_ALL)
+
+        await asyncio.wait_for(job_started.wait(), 5)
+        result = await scheduler.async_shutdown(timeout=5)
+
+        assert result == []
+        error_events = [e for e in events if e.code == EVENT_JOB_ERROR]
+        assert len(error_events) == 1
+        assert str(error_events[0].exception) == "boom"
+
+    @pytest.mark.anyio
+    async def test_prevents_pending_jobs_from_running(self):
+        scheduler = AsyncIOScheduler()
+        ran = asyncio.Event()
+
+        async def jobfunc():
+            ran.set()
+
+        run_date = datetime.now(timezone.utc) + timedelta(seconds=0.3)
+        scheduler.add_job(jobfunc, "date", run_date=run_date)
+        scheduler.start()
+
+        result = await scheduler.async_shutdown(timeout=5)
+
+        assert result == []
+        await asyncio.sleep(0.5)
+        assert not ran.is_set()
+
+    @pytest.mark.anyio
+    async def test_timeout_cancels_coroutine_and_runs_cleanup(self):
+        scheduler = AsyncIOScheduler()
+        job_started = asyncio.Event()
+        cleanup_done = asyncio.Event()
+
+        async def jobfunc():
+            try:
+                job_started.set()
+                await asyncio.sleep(60)
+            finally:
+                cleanup_done.set()
+
+        scheduler.add_job(jobfunc, "date", run_date=datetime.now(timezone.utc))
+        scheduler.start()
+        await asyncio.wait_for(job_started.wait(), 5)
+
+        result = await scheduler.async_shutdown(timeout=0.2)
+
+        assert result == []
+        assert cleanup_done.is_set()
+        assert scheduler.state == STATE_STOPPED
+
+    @pytest.mark.anyio
+    async def test_reports_still_running_thread_jobs(self, caplog):
+        from threading import Event as ThreadEvent
+
+        scheduler = AsyncIOScheduler()
+        started = ThreadEvent()
+        release = ThreadEvent()
+
+        def blocking():
+            started.set()
+            release.wait(10)
+
+        scheduler.add_job(blocking, "date", run_date=datetime.now(timezone.utc))
+        scheduler.start()
+        events = []
+        scheduler.add_listener(events.append, EVENT_ALL)
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+
+        with caplog.at_level(logging.WARNING):
+            result = await scheduler.async_shutdown(timeout=0.2)
+
+        try:
+            assert len(result) == 1
+            assert not result[0].done()
+            assert "still running" in caplog.text
+            assert scheduler.state == STATE_STOPPED
+            assert EVENT_SCHEDULER_SHUTDOWN in [e.code for e in events]
+        finally:
+            # Let the thread finish so it does not leak into other tests
+            release.set()
+            await asyncio.wait_for(result[0], 5)
+
+    @pytest.mark.anyio
+    async def test_concurrent_calls_share_shutdown(self):
+        scheduler = AsyncIOScheduler()
+        job_started = asyncio.Event()
+
+        async def jobfunc():
+            job_started.set()
+            await asyncio.sleep(0.2)
+
+        scheduler.add_job(jobfunc, "date", run_date=datetime.now(timezone.utc))
+        scheduler.start()
+        events = []
+        scheduler.add_listener(events.append, EVENT_ALL)
+        await asyncio.wait_for(job_started.wait(), 5)
+
+        result1, result2 = await asyncio.gather(
+            scheduler.async_shutdown(), scheduler.async_shutdown()
+        )
+
+        assert result1 is result2
+        shutdown_events = [e for e in events if e.code == EVENT_SCHEDULER_SHUTDOWN]
+        assert len(shutdown_events) == 1
+
+    @pytest.mark.anyio
+    async def test_start_rejected_during_shutdown(self):
+        scheduler = AsyncIOScheduler()
+        job_started = asyncio.Event()
+
+        async def jobfunc():
+            job_started.set()
+            await asyncio.sleep(0.5)
+
+        scheduler.add_job(jobfunc, "date", run_date=datetime.now(timezone.utc))
+        scheduler.start()
+        await asyncio.wait_for(job_started.wait(), 5)
+
+        shutdown_task = asyncio.ensure_future(scheduler.async_shutdown(timeout=5))
+        await asyncio.sleep(0.1)
+        with pytest.raises(SchedulerAlreadyRunningError):
+            scheduler.start()
+
+        assert await shutdown_task == []
+
+    @pytest.mark.anyio
+    async def test_restart_after_completed_shutdown(self):
+        scheduler = AsyncIOScheduler()
+        scheduler.start(paused=True)
+        result1 = await scheduler.async_shutdown()
+
+        scheduler.start(paused=True)
+        result2 = await scheduler.async_shutdown()
+
+        assert result2 == []
+        assert result2 is not result1
 
 
 class TestGeventScheduler(SchedulerImplementationTestBase):

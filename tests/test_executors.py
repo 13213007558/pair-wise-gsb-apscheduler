@@ -309,3 +309,126 @@ async def test_asyncio_executor_shutdown(asyncio_scheduler, asyncio_executor):
     asyncio_executor.shutdown()
     with pytest.raises(CancelledError):
         await futures.pop()
+
+
+@pytest.mark.anyio
+async def test_asyncio_executor_async_shutdown_waits_for_jobs(
+    asyncio_scheduler, asyncio_executor
+):
+    """Test that async_shutdown waits for pending jobs and dispatches their events."""
+    from asyncio import sleep
+
+    job = asyncio_scheduler.add_job(waiter, "interval", seconds=1, args=[sleep, None])
+    events = []
+    asyncio_executor._run_job_success = lambda job_id, events_: events.extend(events_)
+    asyncio_executor.submit_job(job, [datetime.now(utc)])
+
+    still_running = await asyncio_executor.async_shutdown(timeout=5)
+
+    assert still_running == []
+    assert len(events) == 1
+    assert events[0].retval is True
+    assert not asyncio_executor._pending_futures
+
+
+@pytest.mark.anyio
+async def test_asyncio_executor_async_shutdown_job_exception(
+    asyncio_scheduler, asyncio_executor
+):
+    """Test that async_shutdown preserves error events of failing coroutine jobs."""
+    from asyncio import sleep
+
+    job = asyncio_scheduler.add_job(waiter, "interval", seconds=1, args=[sleep, True])
+    events = []
+    asyncio_executor._run_job_success = lambda job_id, events_: events.extend(events_)
+    asyncio_executor.submit_job(job, [datetime.now(utc)])
+
+    still_running = await asyncio_executor.async_shutdown(timeout=5)
+
+    assert still_running == []
+    assert len(events) == 1
+    assert events[0].code == EVENT_JOB_ERROR
+    assert str(events[0].exception) == "dummy error"
+
+
+@pytest.mark.anyio
+async def test_asyncio_executor_async_shutdown_cancels_coroutine_on_timeout(
+    asyncio_scheduler, asyncio_executor
+):
+    """Test that on timeout, coroutine jobs are cancelled and their cleanup runs."""
+    import asyncio
+
+    cleanup_done = asyncio.Event()
+
+    async def long_running():
+        try:
+            await asyncio.sleep(60)
+        finally:
+            cleanup_done.set()
+
+    job = asyncio_scheduler.add_job(long_running, "interval", seconds=1)
+    asyncio_executor.submit_job(job, [datetime.now(utc)])
+    futures = asyncio_executor._pending_futures.copy()
+
+    still_running = await asyncio_executor.async_shutdown(timeout=0.1)
+
+    assert still_running == []
+    assert cleanup_done.is_set()
+    assert all(f.done() for f in futures)
+
+
+@pytest.mark.anyio
+async def test_asyncio_executor_async_shutdown_reports_running_thread_jobs(
+    asyncio_scheduler, asyncio_executor, caplog
+):
+    """Test that thread pool jobs outliving the timeout are reported, not cancelled."""
+    import asyncio
+    import logging
+
+    started = Event()
+    release = Event()
+
+    def blocking():
+        started.set()
+        release.wait(10)
+        return "done"
+
+    job = asyncio_scheduler.add_job(blocking, "interval", seconds=1)
+    asyncio_executor.submit_job(job, [datetime.now(utc)])
+    while not started.is_set():
+        await asyncio.sleep(0.01)
+
+    with caplog.at_level(logging.WARNING, logger="apscheduler.executors.default"):
+        still_running = await asyncio_executor.async_shutdown(timeout=0.1)
+
+    try:
+        assert len(still_running) == 1
+        assert not still_running[0].done()
+        assert "still running in a worker thread" in caplog.text
+        assert job.id in caplog.text
+    finally:
+        # Let the thread finish so it does not leak into other tests
+        release.set()
+        await asyncio.wait_for(still_running[0], 5)
+
+
+@pytest.mark.anyio
+async def test_asyncio_executor_async_shutdown_rejects_new_submissions(
+    asyncio_scheduler, asyncio_executor
+):
+    """Test that submissions are rejected once async_shutdown has begun."""
+    import asyncio
+    from asyncio import sleep
+
+    job = asyncio_scheduler.add_job(waiter, "interval", seconds=1, args=[sleep, None])
+    asyncio_executor.submit_job(job, [datetime.now(utc)])
+
+    shutdown_task = asyncio.ensure_future(asyncio_executor.async_shutdown(timeout=5))
+    await asyncio.sleep(0)  # let the shutdown begin
+
+    job2 = asyncio_scheduler.add_job(wait_event, "interval", seconds=1)
+    with pytest.raises(RuntimeError, match="no longer accepts new jobs"):
+        asyncio_executor.submit_job(job2, [datetime.now(utc)])
+
+    still_running = await shutdown_task
+    assert still_running == []

@@ -6,7 +6,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from queue import Queue
-from threading import Thread
+from threading import Event, Thread
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1330,3 +1330,50 @@ class TestQtScheduler(SchedulerImplementationTestBase):
         while queue.empty():
             QCoreApplication.processEvents()
         return queue.get_nowait()
+
+
+def test_max_instances_scoped_per_jobstore():
+    """
+    Tests that two jobs with the same ID in different job stores run concurrently on a shared
+    executor, and that the instance counts are cleaned up afterwards.
+
+    """
+    from apscheduler.schedulers.background import BackgroundScheduler
+
+    started = [Event(), Event()]
+    release = Event()
+    finished = Event()
+    events = []
+
+    def blocking_job(index):
+        started[index].set()
+        release.wait(10)
+        return index
+
+    def listener(event):
+        events.append(event)
+        if (
+            len([evt for evt in events if evt.code == EVENT_JOB_EXECUTED]) == 2
+            and not finished.is_set()
+        ):
+            finished.set()
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_jobstore(MemoryJobStore(), "second")
+    scheduler.add_listener(listener, EVENT_JOB_EXECUTED | EVENT_JOB_MAX_INSTANCES)
+    scheduler.add_job(blocking_job, "date", id="refresh", jobstore="default", args=[0])
+    scheduler.add_job(blocking_job, "date", id="refresh", jobstore="second", args=[1])
+    scheduler.start()
+    try:
+        # Both jobs must be running at the same time despite sharing the same job ID
+        assert started[0].wait(5)
+        assert started[1].wait(5)
+        assert not any(evt.code == EVENT_JOB_MAX_INSTANCES for evt in events)
+
+        release.set()
+        assert finished.wait(5)
+    finally:
+        scheduler.shutdown()
+
+    assert not any(evt.code == EVENT_JOB_MAX_INSTANCES for evt in events)
+    assert not scheduler._executors["default"]._instances

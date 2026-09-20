@@ -12,22 +12,32 @@ class BasePoolExecutor(BaseExecutor):
         super().__init__()
         self._pool = pool
 
-    def _do_submit_job(self, job, run_times):
+    def _do_submit_job(self, job, run_times, execution):
         def callback(f):
+            if f.cancelled():
+                self._finish_execution(execution, self._cancelled_events(execution))
+                return
+
             exc, tb = (
                 f.exception_info()
                 if hasattr(f, "exception_info")
                 else (f.exception(), getattr(f.exception(), "__traceback__", None))
             )
             if exc:
-                self._run_job_error(job.id, exc, tb)
+                self._finish_execution(
+                    execution,
+                    (),
+                    exception=exc,
+                    traceback=tb,
+                )
             else:
-                self._run_job_success(job.id, f.result())
+                self._finish_execution(execution, f.result())
 
         f = self._pool.submit(
             run_job, job, job._jobstore_alias, run_times, self._logger.name
         )
         f.add_done_callback(callback)
+        return f
 
     def shutdown(self, wait=True):
         self._pool.shutdown(wait)
@@ -69,9 +79,9 @@ class ProcessPoolExecutor(BasePoolExecutor):
         )
         super().__init__(pool)
 
-    def _do_submit_job(self, job, run_times):
+    def _do_submit_job(self, job, run_times, execution):
         try:
-            super()._do_submit_job(job, run_times)
+            return super()._do_submit_job(job, run_times, execution)
         except BrokenProcessPool:
             self._logger.warning(
                 "Process pool is broken; replacing pool with a fresh instance"
@@ -79,4 +89,4 @@ class ProcessPoolExecutor(BasePoolExecutor):
             self._pool = self._pool.__class__(
                 self._pool._max_workers, **self.pool_kwargs
             )
-            super()._do_submit_job(job, run_times)
+            return super()._do_submit_job(job, run_times, execution)

@@ -4,6 +4,11 @@ Version history
 To find out how to migrate your application from a previous version of
 APScheduler, see the :doc:`migration section <migration>`.
 
+**UNRELEASED**
+
+- Fixed asyncio job execution slots and events not being released when an execution was cancelled
+  during shutdown or while queued or running
+
 **3.11.0**
 
 - Dropped support for Python 3.6 and 3.7

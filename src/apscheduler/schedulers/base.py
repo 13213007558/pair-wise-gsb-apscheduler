@@ -121,6 +121,7 @@ class BaseScheduler(metaclass=ABCMeta):
         self._listeners = []
         self._listeners_lock = self._create_lock()
         self._pending_jobs = []
+        self._running_executions = {}
         self.state = STATE_STOPPED
         self.configure(gconfig, **options)
 
@@ -211,6 +212,7 @@ class BaseScheduler(metaclass=ABCMeta):
             del self._pending_jobs[:]
 
         self.state = STATE_PAUSED if paused else STATE_RUNNING
+        self._running_executions = {}
         self._logger.info("Scheduler started")
         self._dispatch_event(SchedulerEvent(EVENT_SCHEDULER_STARTED))
 
@@ -617,7 +619,9 @@ class BaseScheduler(metaclass=ABCMeta):
         :return Job: the relevant job instance
 
         """
-        return self.modify_job(job_id, jobstore, next_run_time=None)
+        job = self.modify_job(job_id, jobstore, next_run_time=None)
+        self._cancel_job_executions(job)
+        return job
 
     def resume_job(self, job_id, jobstore=None):
         """
@@ -698,6 +702,7 @@ class BaseScheduler(metaclass=ABCMeta):
 
         """
         jobstore_alias = None
+        removed_job = None
         with self._jobstores_lock:
             # Check if the job is among the pending jobs
             if self.state == STATE_STOPPED:
@@ -705,6 +710,7 @@ class BaseScheduler(metaclass=ABCMeta):
                     if job.id == job_id and jobstore in (None, alias):
                         del self._pending_jobs[i]
                         jobstore_alias = alias
+                        removed_job = job
                         break
             else:
                 # Otherwise, try to remove it from each store until it succeeds or we run out of
@@ -712,6 +718,7 @@ class BaseScheduler(metaclass=ABCMeta):
                 for alias, store in self._jobstores.items():
                     if jobstore in (None, alias):
                         try:
+                            removed_job = store.lookup_job(job_id)
                             store.remove_job(job_id)
                             jobstore_alias = alias
                             break
@@ -720,6 +727,9 @@ class BaseScheduler(metaclass=ABCMeta):
 
         if jobstore_alias is None:
             raise JobLookupError(job_id)
+
+        if removed_job is not None:
+            self._cancel_job_executions(removed_job)
 
         # Notify listeners that a job has been removed
         event = JobEvent(EVENT_JOB_REMOVED, job_id, jobstore_alias)
@@ -750,6 +760,13 @@ class BaseScheduler(metaclass=ABCMeta):
                         store.remove_all_jobs()
 
         self._dispatch_event(SchedulerEvent(EVENT_ALL_JOBS_REMOVED, jobstore))
+
+    def cancel_job(self, job_id, jobstore=None):
+        """Cancels active executions of the named job without changing its schedule."""
+        with self._jobstores_lock:
+            job, jobstore = self._lookup_job(job_id, jobstore)
+
+        return self._cancel_job_executions(job)
 
     def print_jobs(self, jobstore=None, out=None):
         """
@@ -1049,6 +1066,52 @@ class BaseScheduler(metaclass=ABCMeta):
                 "option for the scheduler to work."
             )
 
+    def _register_execution(self, executor, job, run_times):
+        create_method = getattr(type(executor), "_create_execution", None)
+        submit_method = getattr(type(executor), "submit_job", None)
+        if (
+            create_method is BaseExecutor._create_execution
+            and submit_method is BaseExecutor.submit_job
+        ):
+            execution = executor._create_execution(job, run_times)
+        else:
+            return executor.submit_job(job, run_times)
+
+        self._running_executions.setdefault((job.id, id(job)), set()).add(execution)
+        try:
+            future = executor._submit_execution(execution, job, run_times)
+        except BaseException:
+            self._job_execution_finished(execution)
+            raise
+
+        if future is not None:
+            execution.future = future
+        return execution
+
+    def _job_execution_finished(self, execution):
+        keys = tuple(self._running_executions)
+        for key in keys:
+            if key[0] != execution.job_id:
+                continue
+
+            executions = self._running_executions[key]
+            if execution in executions:
+                executions.discard(execution)
+                if not executions:
+                    self._running_executions.pop(key, None)
+                return
+
+    def _cancel_job_executions(self, job, generation=None):
+        generation = id(job) if generation is None else generation
+        executions = tuple(self._running_executions.get((job.id, generation), ()))
+        cancelled = []
+        for execution in executions:
+            executor = self._executors.get(execution.executor_alias)
+            if executor is not None and executor.cancel_execution(execution):
+                cancelled.append(execution)
+
+        return tuple(cancelled)
+
     def _real_add_job(self, job, jobstore_alias, replace_existing):
         """
         :param Job job: the job to add
@@ -1192,7 +1255,7 @@ class BaseScheduler(metaclass=ABCMeta):
                     )
                     if run_times:
                         try:
-                            executor.submit_job(job, run_times)
+                            self._register_execution(executor, job, run_times)
                         except MaxInstancesReachedError:
                             self._logger.warning(
                                 'Execution of job "%s" skipped: maximum number of running '

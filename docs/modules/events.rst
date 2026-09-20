@@ -85,6 +85,9 @@ The following event codes are numeric constants importable from :mod:`apschedule
   * - EVENT_JOB_MISSED
     - A job's execution was missed
     - :class:`JobExecutionEvent`
+  * - EVENT_JOB_CANCELLED
+    - A job's execution was cancelled before it completed
+    - :class:`JobExecutionEvent`
   * - EVENT_ALL
     - A catch-all mask that includes every event type
     - N/A

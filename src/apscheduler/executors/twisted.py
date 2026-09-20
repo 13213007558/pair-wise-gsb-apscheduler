@@ -12,12 +12,17 @@ class TwistedExecutor(BaseExecutor):
         super().start(scheduler, alias)
         self._reactor = scheduler._reactor
 
-    def _do_submit_job(self, job, run_times):
+    def _do_submit_job(self, job, run_times, execution):
         def callback(success, result):
             if success:
-                self._run_job_success(job.id, result)
+                self._finish_execution(execution, result)
             else:
-                self._run_job_error(job.id, result.value, result.tb)
+                self._finish_execution(
+                    execution,
+                    (),
+                    exception=result.value,
+                    traceback=result.tb,
+                )
 
         self._reactor.getThreadPool().callInThreadWithCallback(
             callback, run_job, job, job._jobstore_alias, run_times, self._logger.name

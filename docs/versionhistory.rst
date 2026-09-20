@@ -4,6 +4,13 @@ Version history
 To find out how to migrate your application from a previous version of
 APScheduler, see the :doc:`migration section <migration>`.
 
+**UNRELEASED**
+
+- Added the ``independent`` option to ``OrTrigger`` which gives each combined trigger
+  its own cursor so that triggers depending on the previous fire time (such as
+  ``IntervalTrigger``) keep their own schedules, equal fire times are only emitted once
+  and pending fire times are preserved in the serialized state
+
 **3.11.0**
 
 - Dropped support for Python 3.6 and 3.7

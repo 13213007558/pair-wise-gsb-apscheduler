@@ -34,3 +34,13 @@ Run ``job_function`` every Monday at 2 am and every Tuesday at 3 pm::
     trigger = OrTrigger([CronTrigger(day_of_week='mon', hour=2),
                          CronTrigger(day_of_week='tue', hour=15)])
     scheduler.add_job(job_function, trigger)
+
+Run ``job_function`` every 5 minutes and every 7 minutes, keeping each interval trigger on
+its own schedule (0, 5, 7, 10, 14, 15, ... minutes from the start) by giving each combined
+trigger an independent cursor::
+
+    from apscheduler.triggers.interval import IntervalTrigger
+
+    trigger = OrTrigger([IntervalTrigger(minutes=5), IntervalTrigger(minutes=7)],
+                        independent=True)
+    scheduler.add_job(job_function, trigger)

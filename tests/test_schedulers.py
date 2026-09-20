@@ -43,6 +43,8 @@ from apscheduler.schedulers import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.schedulers.base import STATE_RUNNING, STATE_STOPPED, BaseScheduler
 from apscheduler.triggers.base import BaseTrigger
+from apscheduler.triggers.combining import OrTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.util import undefined
 
 
@@ -1132,6 +1134,114 @@ class TestProcessJobs:
         }
 
         assert scheduler._process_jobs() == 5
+
+
+def independent_or_trigger_job():
+    """Module-level job target (must be importable for job stores that pickle jobs)."""
+
+
+class TestIndependentOrTrigger:
+    @pytest.fixture
+    def start_date(self, freeze_time):
+        return freeze_time.current
+
+    @pytest.fixture
+    def trigger(self, start_date, timezone):
+        return OrTrigger(
+            [
+                IntervalTrigger(minutes=5, start_date=start_date, timezone=timezone),
+                IntervalTrigger(minutes=7, start_date=start_date, timezone=timezone),
+            ],
+            independent=True,
+        )
+
+    @pytest.fixture
+    def run_times(self):
+        return []
+
+    @pytest.fixture
+    def scheduler(self, timezone, run_times):
+        scheduler = DummyScheduler()
+        scheduler.add_executor(DebugExecutor())
+        scheduler.add_listener(
+            lambda event: run_times.extend(event.scheduled_run_times),
+            EVENT_JOB_SUBMITTED,
+        )
+        return scheduler
+
+    @pytest.mark.parametrize("coalesce", [True, False], ids=["coalesce", "no-coalesce"])
+    def test_run_times_after_downtime(
+        self, scheduler, trigger, freeze_time, start_date, run_times, coalesce
+    ):
+        scheduler.add_job(
+            independent_or_trigger_job,
+            trigger,
+            id="test",
+            coalesce=coalesce,
+            misfire_grace_time=None,
+        )
+        scheduler.start()
+
+        # The job first runs on time...
+        scheduler._process_jobs()
+        # ...then the scheduler is unable to run jobs for 16 minutes...
+        freeze_time.set(start_date + timedelta(minutes=16))
+        scheduler._process_jobs()
+        # ...and then it runs on time again
+        for minute in (20, 21):
+            freeze_time.set(start_date + timedelta(minutes=minute))
+            scheduler._process_jobs()
+
+        if coalesce:
+            expected_offsets = [0, 15, 20, 21]
+        else:
+            expected_offsets = [0, 5, 7, 10, 14, 15, 20, 21]
+        expected = [
+            start_date + timedelta(minutes=offset) for offset in expected_offsets
+        ]
+        assert run_times == expected
+
+    def test_run_times_after_restart(
+        self, tmp_path, trigger, freeze_time, start_date, timezone
+    ):
+        from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+
+        jobstore_url = f"sqlite:///{tmp_path}/jobs.sqlite"
+        scheduler = DummyScheduler()
+        scheduler.add_executor(DebugExecutor())
+        scheduler.add_jobstore(SQLAlchemyJobStore(url=jobstore_url), "default")
+        scheduler.add_job(
+            independent_or_trigger_job,
+            trigger,
+            id="test",
+            coalesce=False,
+            misfire_grace_time=None,
+        )
+        scheduler.start()
+        scheduler._process_jobs()
+        freeze_time.set(start_date + timedelta(minutes=5))
+        scheduler._process_jobs()
+        scheduler.shutdown()
+
+        # "Restart" the scheduler 11 minutes later, using the same persistent job store
+        freeze_time.set(start_date + timedelta(minutes=16))
+        run_times = []
+        scheduler2 = DummyScheduler()
+        scheduler2.add_executor(DebugExecutor())
+        scheduler2.add_jobstore(SQLAlchemyJobStore(url=jobstore_url), "default")
+        scheduler2.add_listener(
+            lambda event: run_times.extend(event.scheduled_run_times),
+            EVENT_JOB_SUBMITTED,
+        )
+        scheduler2.start()
+        scheduler2._process_jobs()
+
+        # None of the fire times that passed while the scheduler was down may be skipped
+        expected_offsets = [7, 10, 14, 15]
+        expected = [
+            start_date + timedelta(minutes=offset) for offset in expected_offsets
+        ]
+        assert run_times == expected
 
 
 class SchedulerImplementationTestBase:

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from apscheduler.job import Job
+from apscheduler.job import CoalescePolicy, Job
 from apscheduler.schedulers.base import BaseScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.util import localize
@@ -211,6 +211,34 @@ def test_private_modify_bad_argument(job):
     )
 
 
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("earliest", CoalescePolicy.earliest),
+        ("LATEST", CoalescePolicy.latest),
+        (" all ", CoalescePolicy.all),
+        (CoalescePolicy.earliest, CoalescePolicy.earliest),
+        (CoalescePolicy.latest, CoalescePolicy.latest),
+        (CoalescePolicy.all, CoalescePolicy.all),
+        (True, CoalescePolicy.latest),
+        (False, CoalescePolicy.all),
+        ("true", CoalescePolicy.latest),
+        ("false", CoalescePolicy.all),
+    ],
+)
+def test_modify_coalesce(job, value, expected):
+    """Tests that the coalesce option accepts policies, legacy booleans and strings."""
+    job._modify(coalesce=value)
+    assert job.coalesce is expected
+
+
+@pytest.mark.parametrize("value", ["sometimes", "", 1, 0, 2.5, None, ["all"]])
+def test_modify_coalesce_invalid(job, value):
+    """Tests that invalid coalesce values are explicitly rejected."""
+    exc = pytest.raises(ValueError, job._modify, coalesce=value)
+    assert "invalid coalesce policy" in str(exc.value)
+
+
 def test_getstate(job):
     state = job.__getstate__()
     assert state == dict(
@@ -223,7 +251,7 @@ def test_getstate(job):
         kwargs={},
         id=b"t\xc3\xa9st\xc3\xafd".decode("utf-8"),
         misfire_grace_time=1,
-        coalesce=False,
+        coalesce="all",
         max_instances=1,
         next_run_time=None,
     )
@@ -257,7 +285,7 @@ def test_setstate(job, timezone):
     assert job.kwargs == {}
     assert job.name == "testjob.dummyfunc"
     assert job.misfire_grace_time == 2
-    assert job.coalesce is True
+    assert job.coalesce is CoalescePolicy.latest
     assert job.max_instances == 2
     assert job.next_run_time is None
 
@@ -266,6 +294,28 @@ def test_setstate_bad_version(job):
     """Tests that __setstate__ rejects state of higher version that it was designed to handle."""
     exc = pytest.raises(ValueError, job.__setstate__, {"version": 9999})
     assert "Job has version 9999, but only version" in str(exc.value)
+
+
+def test_coalesce_policy_state_roundtrip(job):
+    """Tests that the coalesce policy survives a getstate/setstate round trip."""
+    job._modify(coalesce="earliest")
+    state = job.__getstate__()
+    assert state["coalesce"] == "earliest"
+
+    job.__setstate__(state)
+    assert job.coalesce is CoalescePolicy.earliest
+
+
+@pytest.mark.parametrize(
+    "legacy_value, expected",
+    [(True, CoalescePolicy.latest), (False, CoalescePolicy.all)],
+)
+def test_setstate_legacy_bool_coalesce(job, legacy_value, expected):
+    """Tests that job states serialized with boolean coalesce values still load."""
+    state = job.__getstate__()
+    state["coalesce"] = legacy_value
+    job.__setstate__(state)
+    assert job.coalesce is expected
 
 
 def test_eq(create_job):

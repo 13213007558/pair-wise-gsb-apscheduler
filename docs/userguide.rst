@@ -421,9 +421,27 @@ scheduler) to see if the execution should still be triggered. This can lead into
 executed several times in succession.
 
 If this behavior is undesirable for your particular use case, it is possible to use ``coalescing`` to
-roll all these missed executions into one. In other words, if coalescing is enabled for the job and
-the scheduler sees one or more queued executions for the job, it will only trigger it once. No
-misfire events will be sent for the "bypassed" runs.
+roll all these missed executions into one. Coalescing is controlled by the job's ``coalesce``
+option, which accepts one of three policies (see :class:`~apscheduler.job.CoalescePolicy`):
+
+* ``"earliest"``: only the earliest missed run time is executed
+* ``"latest"``: only the latest missed run time is executed
+* ``"all"``: all the missed run times are executed, in chronological order
+
+For backwards compatibility, ``True`` is accepted as an alias for ``"latest"`` and ``False``
+as an alias for ``"all"``. Any other value is rejected.
+
+For example, suppose a job is scheduled to run at 09:00, 09:10 and 09:20, but the scheduler only
+gets around to processing it at 09:25 (due to a shutdown or the job being paused). With
+``"earliest"`` the job is run once for the 09:00 schedule, with ``"latest"`` once for the
+09:20 schedule and with ``"all"`` three times, once for each schedule. Regardless of the
+policy, the next run time afterwards will be 09:30 -- the skipped run times are never
+resubmitted on later rounds.
+
+The ``misfire_grace_time`` check is applied to each of the run times selected by the policy,
+against their original scheduled times. No misfire events are sent for the runs that were
+bypassed by coalescing, and the submission events only contain the run times that were
+actually submitted.
 
 .. note::
     If the execution of a job is delayed due to no threads or processes being available in the

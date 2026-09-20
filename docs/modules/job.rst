@@ -6,5 +6,8 @@
 API
 ---
 
+.. autoclass:: CoalescePolicy
+    :members:
+
 .. autoclass:: Job
     :members:

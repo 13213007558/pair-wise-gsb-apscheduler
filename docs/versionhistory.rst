@@ -6,6 +6,9 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **3.11.0**
 
+- Added explicit coalescing policies (``"earliest"``, ``"latest"`` and ``"all"``, see
+  :class:`~apscheduler.job.CoalescePolicy`) for the ``coalesce`` job option; the legacy
+  boolean values (``True`` = ``"latest"``, ``False`` = ``"all"``) are still accepted
 - Dropped support for Python 3.6 and 3.7
 - Added support for ``ZoneInfo`` time zones and deprecated support for pytz time zones
 - Added ``CalendarIntervalTrigger``, backported from the 4.x series

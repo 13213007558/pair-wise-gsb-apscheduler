@@ -16,6 +16,16 @@ else:
     from zoneinfo import ZoneInfo
 
 
+class FakeDateTime(datetime):
+    """A datetime stand-in whose now() is controlled by the TimeFreezer below."""
+
+    freezer = None
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.freezer.get(tz)
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
@@ -63,11 +73,11 @@ def freeze_time(monkeypatch, timezone):
             self.increment = delta
 
     freezer = TimeFreezer(localize(datetime(2011, 4, 3, 18, 40), timezone))
-    fake_datetime = Mock(datetime, now=freezer.get)
-    monkeypatch.setattr("apscheduler.schedulers.base.datetime", fake_datetime)
-    monkeypatch.setattr("apscheduler.executors.base.datetime", fake_datetime)
-    monkeypatch.setattr("apscheduler.triggers.interval.datetime", fake_datetime)
-    monkeypatch.setattr("apscheduler.triggers.date.datetime", fake_datetime)
+    FakeDateTime.freezer = freezer
+    monkeypatch.setattr("apscheduler.schedulers.base.datetime", FakeDateTime)
+    monkeypatch.setattr("apscheduler.executors.base.datetime", FakeDateTime)
+    monkeypatch.setattr("apscheduler.triggers.interval.datetime", FakeDateTime)
+    monkeypatch.setattr("apscheduler.triggers.date.datetime", FakeDateTime)
     return freezer
 
 

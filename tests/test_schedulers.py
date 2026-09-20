@@ -20,6 +20,7 @@ from apscheduler.events import (
     EVENT_JOB_ADDED,
     EVENT_JOB_EXECUTED,
     EVENT_JOB_MAX_INSTANCES,
+    EVENT_JOB_MISSED,
     EVENT_JOB_MODIFIED,
     EVENT_JOB_REMOVED,
     EVENT_JOB_SUBMITTED,
@@ -33,7 +34,7 @@ from apscheduler.events import (
 )
 from apscheduler.executors.base import BaseExecutor, MaxInstancesReachedError
 from apscheduler.executors.debug import DebugExecutor
-from apscheduler.job import Job
+from apscheduler.job import CoalescePolicy, Job
 from apscheduler.jobstores.base import BaseJobStore, ConflictingIdError, JobLookupError
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers import (
@@ -449,7 +450,7 @@ class TestBaseScheduler:
 
         # Check that the undefined values were replaced with scheduler's job defaults
         assert job.misfire_grace_time == 3
-        assert not job.coalesce
+        assert job.coalesce is CoalescePolicy.all
         assert job.max_instances == 6
 
     def test_add_job_id_conflict(self, scheduler):
@@ -863,7 +864,7 @@ Jobstore other:
         assert scheduler.timezone == timezone.utc
         assert scheduler._job_defaults == {
             "misfire_grace_time": 5,
-            "coalesce": False,
+            "coalesce": CoalescePolicy.all,
             "max_instances": 9,
         }
         assert set(scheduler._executors) == {"default", "alter"}
@@ -1132,6 +1133,339 @@ class TestProcessJobs:
         }
 
         assert scheduler._process_jobs() == 5
+
+
+class TestCoalescePolicy:
+    @pytest.fixture
+    def scheduler(self):
+        scheduler = DummyScheduler()
+        scheduler.add_executor(DebugExecutor())
+        scheduler.start()
+        yield scheduler
+        scheduler.shutdown()
+
+    @pytest.fixture
+    def submitted_events(self, scheduler):
+        events = []
+        scheduler.add_listener(events.append, EVENT_JOB_SUBMITTED)
+        return events
+
+    def add_interval_job(self, scheduler, freeze_time, **kwargs):
+        start = freeze_time.current - timedelta(minutes=25)
+        kwargs.setdefault("id", "testjob")
+        kwargs.setdefault("misfire_grace_time", None)
+        return scheduler.add_job(
+            lambda: None,
+            "interval",
+            minutes=10,
+            start_date=start,
+            next_run_time=start,
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize(
+        "coalesce, run_offsets",
+        [
+            ("earliest", [0]),
+            ("latest", [20]),
+            ("all", [0, 10, 20]),
+            (CoalescePolicy.earliest, [0]),
+            (True, [20]),
+            (False, [0, 10, 20]),
+        ],
+        ids=["earliest", "latest", "all", "enum", "legacy-true", "legacy-false"],
+    )
+    def test_recovery_after_downtime(
+        self, scheduler, freeze_time, submitted_events, coalesce, run_offsets
+    ):
+        """
+        Tests that when the scheduler recovers to find several due run times, the
+        job's coalesce policy determines which of them are submitted, and that the
+        next run time moves past all of them regardless of the policy.
+
+        """
+        start = freeze_time.current - timedelta(minutes=25)
+        self.add_interval_job(scheduler, freeze_time, coalesce=coalesce)
+
+        scheduler._process_jobs()
+
+        expected = [start + timedelta(minutes=offset) for offset in run_offsets]
+        assert len(submitted_events) == 1
+        assert submitted_events[0].scheduled_run_times == expected
+        assert scheduler.get_job("testjob").next_run_time == start + timedelta(
+            minutes=30
+        )
+
+        # The next round must only submit newly due run times -- the "earliest"
+        # policy must not keep catching up on the runs it skipped
+        freeze_time.set(freeze_time.current + timedelta(minutes=10))
+        scheduler._process_jobs()
+        assert len(submitted_events) == 2
+        assert submitted_events[1].scheduled_run_times == [
+            start + timedelta(minutes=30)
+        ]
+
+    def test_pause_resume(self, scheduler, freeze_time, submitted_events):
+        """
+        Tests that run times accumulated while the scheduler was paused are handled
+        according to the coalesce policy when the scheduler is resumed.
+
+        """
+        start = freeze_time.current
+        scheduler.add_job(
+            lambda: None,
+            "interval",
+            minutes=10,
+            start_date=start,
+            next_run_time=start,
+            coalesce="earliest",
+            misfire_grace_time=None,
+            id="testjob",
+        )
+        scheduler.pause()
+        freeze_time.set(start + timedelta(minutes=25))
+
+        # No jobs are processed while the scheduler is paused
+        scheduler._process_jobs()
+        assert submitted_events == []
+
+        scheduler.resume()
+        scheduler._process_jobs()
+        assert len(submitted_events) == 1
+        assert submitted_events[0].scheduled_run_times == [start]
+        assert scheduler.get_job("testjob").next_run_time == start + timedelta(
+            minutes=30
+        )
+
+    def test_modify_job_coalesce(self, scheduler, freeze_time):
+        job = self.add_interval_job(scheduler, freeze_time, coalesce="all")
+        assert job.coalesce is CoalescePolicy.all
+
+        scheduler.modify_job(job.id, coalesce="earliest")
+        assert job.coalesce is CoalescePolicy.earliest
+
+        scheduler.modify_job(job.id, coalesce=True)
+        assert job.coalesce is CoalescePolicy.latest
+
+    @pytest.mark.parametrize("value", ["sometimes", "", 1, 0, 2.5, None, ["all"]])
+    def test_invalid_coalesce_rejected(self, scheduler, freeze_time, value):
+        job = self.add_interval_job(scheduler, freeze_time)
+        exc = pytest.raises(ValueError, scheduler.modify_job, job.id, coalesce=value)
+        assert "invalid coalesce policy" in str(exc.value)
+
+        exc = pytest.raises(
+            ValueError,
+            scheduler.add_job,
+            lambda: None,
+            "interval",
+            minutes=10,
+            coalesce=value,
+        )
+        assert "invalid coalesce policy" in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "configured, expected",
+        [
+            ("earliest", CoalescePolicy.earliest),
+            ("latest", CoalescePolicy.latest),
+            ("all", CoalescePolicy.all),
+            (True, CoalescePolicy.latest),
+            (False, CoalescePolicy.all),
+            ("true", CoalescePolicy.latest),
+            ("false", CoalescePolicy.all),
+        ],
+    )
+    def test_job_defaults_coalesce(self, configured, expected):
+        scheduler = DummyScheduler(job_defaults={"coalesce": configured})
+        assert scheduler._job_defaults["coalesce"] is expected
+
+    @pytest.mark.parametrize("configured", ["sometimes", 2, None])
+    def test_job_defaults_coalesce_invalid(self, configured):
+        exc = pytest.raises(
+            ValueError, DummyScheduler, job_defaults={"coalesce": configured}
+        )
+        assert "invalid coalesce policy" in str(exc.value)
+
+    def test_finite_trigger_all_policy(self, scheduler, freeze_time):
+        """
+        Tests that with the "all" policy, all the remaining run times of a finite
+        trigger are submitted before the job is removed from the job store.
+
+        """
+        events = []
+        scheduler.add_listener(events.append, EVENT_JOB_SUBMITTED | EVENT_JOB_REMOVED)
+        start = freeze_time.current - timedelta(minutes=20)
+        end = start + timedelta(minutes=20)
+        scheduler.add_job(
+            lambda: None,
+            "interval",
+            minutes=10,
+            start_date=start,
+            end_date=end,
+            next_run_time=start,
+            coalesce="all",
+            misfire_grace_time=None,
+            id="testjob",
+        )
+
+        scheduler._process_jobs()
+
+        submitted = [e for e in events if e.code == EVENT_JOB_SUBMITTED]
+        assert len(submitted) == 1
+        assert submitted[0].scheduled_run_times == [
+            start,
+            start + timedelta(minutes=10),
+            end,
+        ]
+        assert scheduler.get_jobs() == []
+        assert any(event.code == EVENT_JOB_REMOVED for event in events)
+
+    @pytest.mark.parametrize(
+        "coalesce, run_offsets",
+        [("earliest", [0]), ("latest", [20]), ("all", [0, 10, 20])],
+    )
+    def test_max_instances_event_reflects_policy(
+        self, scheduler, freeze_time, coalesce, run_offsets
+    ):
+        class MaxedOutExecutor(DebugExecutor):
+            def submit_job(self, job, run_times):
+                raise MaxInstancesReachedError(job)
+
+        scheduler.add_executor(MaxedOutExecutor(), "maxed")
+        events = []
+        scheduler.add_listener(events.append, EVENT_JOB_MAX_INSTANCES)
+        start = freeze_time.current - timedelta(minutes=25)
+        self.add_interval_job(
+            scheduler, freeze_time, coalesce=coalesce, executor="maxed"
+        )
+
+        scheduler._process_jobs()
+
+        assert len(events) == 1
+        assert events[0].scheduled_run_times == [
+            start + timedelta(minutes=offset) for offset in run_offsets
+        ]
+
+    @pytest.mark.parametrize(
+        "coalesce, missed_offsets, executed_offsets",
+        [
+            ("earliest", [0], []),
+            ("latest", [], [20]),
+            ("all", [0, 10], [20]),
+        ],
+    )
+    def test_misfire_grace_time_applies_to_selected_run_times(
+        self, scheduler, freeze_time, coalesce, missed_offsets, executed_offsets
+    ):
+        """
+        Tests that misfire_grace_time is checked against the original scheduled run
+        times selected by the coalesce policy (and not, say, the current time).
+
+        """
+        events = []
+        scheduler.add_listener(events.append, EVENT_JOB_MISSED | EVENT_JOB_EXECUTED)
+        start = freeze_time.current - timedelta(minutes=25)
+        self.add_interval_job(
+            scheduler, freeze_time, coalesce=coalesce, misfire_grace_time=600
+        )
+
+        scheduler._process_jobs()
+
+        missed = [e for e in events if e.code == EVENT_JOB_MISSED]
+        executed = [e for e in events if e.code == EVENT_JOB_EXECUTED]
+        assert [e.scheduled_run_time for e in missed] == [
+            start + timedelta(minutes=offset) for offset in missed_offsets
+        ]
+        assert [e.scheduled_run_time for e in executed] == [
+            start + timedelta(minutes=offset) for offset in executed_offsets
+        ]
+
+    def test_persistent_jobstore_restart(self, freeze_time):
+        """
+        Tests that the coalesce policy survives serialization (the way persistent
+        job stores store jobs) and a scheduler "restart".
+
+        """
+        start = freeze_time.current - timedelta(minutes=25)
+
+        scheduler = DummyScheduler()
+        scheduler.start()
+        scheduler.add_job(
+            print,
+            "interval",
+            minutes=10,
+            start_date=start,
+            next_run_time=start,
+            coalesce="earliest",
+            misfire_grace_time=None,
+            id="testjob",
+        )
+        # Persistent job stores serialize jobs with pickle
+        serialized_jobs = [
+            pickle.dumps(job.__getstate__()) for job in scheduler.get_jobs()
+        ]
+        scheduler.shutdown()
+
+        # Simulate a restart: a fresh scheduler restores the serialized jobs
+        scheduler = DummyScheduler()
+        scheduler.add_executor(DebugExecutor())
+        events = []
+        scheduler.add_listener(events.append, EVENT_JOB_SUBMITTED)
+        scheduler.start()
+        try:
+            for state in serialized_jobs:
+                job = Job.__new__(Job)
+                job.__setstate__(pickle.loads(state))
+                job._scheduler = scheduler
+                scheduler._jobstores["default"].add_job(job)
+
+            assert scheduler.get_job("testjob").coalesce is CoalescePolicy.earliest
+
+            scheduler._process_jobs()
+            assert len(events) == 1
+            assert events[0].scheduled_run_times == [start]
+            assert scheduler.get_job("testjob").next_run_time == start + timedelta(
+                minutes=30
+            )
+        finally:
+            scheduler.shutdown()
+
+    @pytest.mark.parametrize("coalesce", ["earliest", "latest", "all"])
+    def test_export_import_jobs(self, scheduler, coalesce):
+        """Tests that the coalesce policy survives an export/import round trip."""
+        scheduler.add_job(
+            print, "interval", minutes=10, coalesce=coalesce, id="testjob"
+        )
+
+        buffer = StringIO()
+        scheduler.export_jobs(buffer)
+        data = json.loads(buffer.getvalue())
+        assert data["jobs"][0]["coalesce"] == coalesce
+
+        new_scheduler = DummyScheduler()
+        new_scheduler.start(paused=True)
+        buffer.seek(0)
+        new_scheduler.import_jobs(buffer)
+        assert new_scheduler.get_job("testjob").coalesce is CoalescePolicy(coalesce)
+        new_scheduler.shutdown()
+
+    @pytest.mark.parametrize(
+        "legacy_value, expected",
+        [(True, CoalescePolicy.latest), (False, CoalescePolicy.all)],
+    )
+    def test_import_legacy_boolean_coalesce(self, scheduler, legacy_value, expected):
+        """Tests that exports with boolean coalesce values can still be imported."""
+        scheduler.add_job(print, "interval", minutes=10, id="testjob")
+        buffer = StringIO()
+        scheduler.export_jobs(buffer)
+        data = json.loads(buffer.getvalue())
+        data["jobs"][0]["coalesce"] = legacy_value
+
+        new_scheduler = DummyScheduler()
+        new_scheduler.start(paused=True)
+        new_scheduler.import_jobs(StringIO(json.dumps(data)))
+        assert new_scheduler.get_job("testjob").coalesce is expected
+        new_scheduler.shutdown()
 
 
 class SchedulerImplementationTestBase:

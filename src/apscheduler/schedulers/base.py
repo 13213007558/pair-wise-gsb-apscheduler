@@ -32,7 +32,7 @@ from apscheduler.events import (
 )
 from apscheduler.executors.base import BaseExecutor, MaxInstancesReachedError
 from apscheduler.executors.pool import ThreadPoolExecutor
-from apscheduler.job import Job
+from apscheduler.job import CoalescePolicy, Job, coerce_coalesce_policy
 from apscheduler.jobstores.base import BaseJobStore, ConflictingIdError, JobLookupError
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers import (
@@ -41,7 +41,6 @@ from apscheduler.schedulers import (
 )
 from apscheduler.triggers.base import BaseTrigger
 from apscheduler.util import (
-    asbool,
     asint,
     astimezone,
     maybe_ref,
@@ -469,8 +468,11 @@ class BaseScheduler(metaclass=ABCMeta):
         :param str|unicode name: textual description of the job
         :param int misfire_grace_time: seconds after the designated runtime that the job is still
             allowed to be run (or ``None`` to allow the job to run no matter how late it is)
-        :param bool coalesce: run once instead of many times if the scheduler determines that the
-            job should be run more than once in succession
+        :param apscheduler.job.CoalescePolicy|str|bool coalesce: determines which of the
+            accumulated due run times are run when the job has fallen behind schedule:
+            ``"earliest"`` runs only the earliest due run time, ``"latest"`` only the latest
+            one and ``"all"`` runs all of them in order; for backwards compatibility,
+            ``True`` is equivalent to ``"latest"`` and ``False`` to ``"all"``
         :param int max_instances: maximum number of concurrently running instances allowed for this
             job
         :param datetime next_run_time: when to first run the job, regardless of the trigger (pass
@@ -907,7 +909,7 @@ class BaseScheduler(metaclass=ABCMeta):
         job_defaults = config.get("job_defaults", {})
         self._job_defaults = {
             "misfire_grace_time": asint(job_defaults.get("misfire_grace_time", 1)),
-            "coalesce": asbool(job_defaults.get("coalesce", True)),
+            "coalesce": coerce_coalesce_policy(job_defaults.get("coalesce", True)),
             "max_instances": asint(job_defaults.get("max_instances", 1)),
         }
 
@@ -1186,11 +1188,17 @@ class BaseScheduler(metaclass=ABCMeta):
                         self.remove_job(job.id, jobstore_alias)
                         continue
 
-                    run_times = job._get_run_times(now)
-                    run_times = (
-                        run_times[-1:] if run_times and job.coalesce else run_times
-                    )
-                    if run_times:
+                    due_run_times = job._get_run_times(now)
+                    if due_run_times:
+                        # Pick the run times to actually submit, based on the job's
+                        # coalesce policy
+                        if job.coalesce is CoalescePolicy.latest:
+                            run_times = due_run_times[-1:]
+                        elif job.coalesce is CoalescePolicy.earliest:
+                            run_times = due_run_times[:1]
+                        else:
+                            run_times = due_run_times
+
                         try:
                             executor.submit_job(job, run_times)
                         except MaxInstancesReachedError:
@@ -1221,8 +1229,12 @@ class BaseScheduler(metaclass=ABCMeta):
 
                         # Update the job if it has a next execution time.
                         # Otherwise remove it from the job store.
+                        # The next run time is always computed from the last due run
+                        # time (not the last submitted one), so that the "earliest"
+                        # policy does not cause the remaining due run times to be
+                        # resubmitted on the next round.
                         job_next_run = job.trigger.get_next_fire_time(
-                            run_times[-1], now
+                            due_run_times[-1], now
                         )
                         if job_next_run:
                             job._modify(next_run_time=job_next_run)

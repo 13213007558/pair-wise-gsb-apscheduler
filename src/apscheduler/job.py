@@ -1,9 +1,11 @@
 from collections.abc import Iterable, Mapping
+from enum import Enum
 from inspect import isclass, ismethod
 from uuid import uuid4
 
 from apscheduler.triggers.base import BaseTrigger
 from apscheduler.util import (
+    asbool,
     check_callable_args,
     convert_to_datetime,
     datetime_repr,
@@ -11,6 +13,55 @@ from apscheduler.util import (
     obj_to_ref,
     ref_to_obj,
 )
+
+
+class CoalescePolicy(Enum):
+    """
+    Policy that determines what happens when a job has accumulated several due run times
+    (for example after the scheduler has been down or the job has been paused).
+
+    :ivar earliest: run only the earliest missed run time
+    :ivar latest: run only the latest missed run time
+    :ivar all: run all the missed run times, in order
+    """
+
+    earliest = "earliest"
+    latest = "latest"
+    all = "all"
+
+
+def coerce_coalesce_policy(value):
+    """
+    Normalizes a coalesce option value to a :class:`CoalescePolicy` member.
+
+    Accepts :class:`CoalescePolicy` members and their string values (case insensitive).
+    For backwards compatibility, booleans are also accepted (``True`` means
+    ``latest`` and ``False`` means ``all``), as are boolean-like strings such as
+    ``"true"`` and ``"false"``.
+
+    :raises ValueError: if the value cannot be interpreted as a coalesce policy
+    :rtype: CoalescePolicy
+
+    """
+    if isinstance(value, CoalescePolicy):
+        return value
+    if isinstance(value, bool):
+        return CoalescePolicy.latest if value else CoalescePolicy.all
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("earliest", "latest", "all"):
+            return CoalescePolicy(normalized)
+        try:
+            legacy_value = asbool(normalized)
+        except ValueError:
+            pass
+        else:
+            return CoalescePolicy.latest if legacy_value else CoalescePolicy.all
+
+    raise ValueError(
+        f"invalid coalesce policy: {value!r} (expected 'earliest', 'latest' or 'all', "
+        "or a boolean for backwards compatibility)"
+    )
 
 
 class Job:
@@ -23,7 +74,8 @@ class Job:
     :var func: the callable to execute
     :var tuple|list args: positional arguments to the callable
     :var dict kwargs: keyword arguments to the callable
-    :var bool coalesce: whether to only run the job once when several run times are due
+    :var CoalescePolicy coalesce: determines which of the due run times are actually run when
+        several run times have become due at once (see :class:`CoalescePolicy`)
     :var trigger: the trigger object that controls the schedule of this job
     :var str executor: the name of the executor that will run this job
     :var int misfire_grace_time: the time (in seconds) how much this job's execution is allowed to
@@ -214,8 +266,7 @@ class Job:
             approved["misfire_grace_time"] = value
 
         if "coalesce" in changes:
-            value = bool(changes.pop("coalesce"))
-            approved["coalesce"] = value
+            approved["coalesce"] = coerce_coalesce_policy(changes.pop("coalesce"))
 
         if "max_instances" in changes:
             value = changes.pop("max_instances")
@@ -285,7 +336,7 @@ class Job:
             "kwargs": self.kwargs,
             "name": self.name,
             "misfire_grace_time": self.misfire_grace_time,
-            "coalesce": self.coalesce,
+            "coalesce": self.coalesce.value,
             "max_instances": self.max_instances,
             "next_run_time": self.next_run_time,
         }
@@ -305,7 +356,7 @@ class Job:
         self.kwargs = state["kwargs"]
         self.name = state["name"]
         self.misfire_grace_time = state["misfire_grace_time"]
-        self.coalesce = state["coalesce"]
+        self.coalesce = coerce_coalesce_policy(state["coalesce"])
         self.max_instances = state["max_instances"]
         self.next_run_time = state["next_run_time"]
 

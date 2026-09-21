@@ -280,7 +280,8 @@ class DataStore(metaclass=ABCMeta):
         The data store is responsible for updating the following fields on stored
         schedules:
 
-        * ``last_fire_time``
+        * ``last_fire_time`` (unless it is ``None`` in the result, in which case
+          the stored value must be left unchanged)
         * ``next_fire_time``
         * ``trigger``
         * ``acquired_by`` (must beset to ``None``)

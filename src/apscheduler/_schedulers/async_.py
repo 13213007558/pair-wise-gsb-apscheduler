@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import platform
-import random
 import sys
 from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from contextlib import AsyncExitStack
@@ -10,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from inspect import isbuiltin, isclass, ismethod, ismodule
 from logging import Logger, getLogger
+from random import Random
 from types import TracebackType
 from typing import Any, Literal, TypeAlias, TypeVar, cast, overload
 from uuid import UUID, uuid4
@@ -105,6 +105,12 @@ class AsyncScheduler:
         calls to :meth:`cleanup` – ``None`` to disable automatic clean-up
     :param lease_duration: maximum amount of time (as seconds or timedelta) that
         the scheduler can keep a lock on a schedule or task
+    :param random_source: the random number generator used to calculate jitter for
+        scheduled jobs (inject a seeded :class:`~random.Random` instance to make
+        jitter deterministic, e.g. in tests)
+    :param clock: a callable that returns the current time as an aware
+        :class:`~datetime.datetime`, used by the scheduler when processing schedules
+        and checking job start deadlines (mainly useful for testing)
     :param logger: the logger instance used to log events from the scheduler, data store
         and event broker
     """
@@ -133,6 +139,10 @@ class AsyncScheduler:
         default=timedelta(minutes=15),
     )
     lease_duration: timedelta = attrs.field(converter=as_timedelta, default=30)
+    random_source: Random = attrs.field(kw_only=True, factory=Random)
+    clock: Callable[[], datetime] = attrs.field(
+        kw_only=True, default=partial(datetime.now, timezone.utc)
+    )
     logger: Logger = attrs.field(kw_only=True, default=getLogger(__name__))
 
     _state: RunState = attrs.field(init=False, default=RunState.stopped)
@@ -502,6 +512,8 @@ class AsyncScheduler:
         :param metadata: key-value pairs for storing JSON compatible custom information
         :param max_jitter: maximum time (in seconds, or as a timedelta) to randomly add
             to the scheduled time for each job created from this schedule
+            (the jitter is added to the job's scheduled run time, but does not extend
+            its start deadline)
         :param job_result_expiration_time: minimum time (in seconds, or as a timedelta)
             to keep the job results in storage from the jobs created by this schedule
         :param conflict_policy: determines what to do if a schedule with the same ID
@@ -969,9 +981,28 @@ class AsyncScheduler:
                     )
                     exit_stack.callback(tg.cancel_scope.cancel)
 
-                    now = datetime.now(timezone.utc)
+                    now = self.clock()
                     results: list[ScheduleResult] = []
                     for schedule in schedules:
+                        # Skip schedules whose next fire time is still in the
+                        # future according to this scheduler's clock (the data
+                        # store may have a different idea of the current time)
+                        if schedule.next_fire_time is None or (
+                            schedule.next_fire_time > now
+                        ):
+                            # Release the claim on the schedule without changing
+                            # any of its fire times
+                            results.append(
+                                ScheduleResult(
+                                    schedule_id=schedule.id,
+                                    task_id=schedule.task_id,
+                                    trigger=schedule.trigger,
+                                    last_fire_time=None,
+                                    next_fire_time=schedule.next_fire_time,
+                                )
+                            )
+                            continue
+
                         # Calculate a next fire time for the schedule, if possible
                         fire_times = [schedule.next_fire_time]
                         calculate_next = schedule.trigger.next
@@ -1008,30 +1039,32 @@ class AsyncScheduler:
                             # Calculate a jitter if max_jitter > 0
                             jitter = _zero_timedelta
                             if max_jitter:
-                                if i + 1 < len(fire_times):
-                                    following_fire_time = fire_times[i + 1]
-                                else:
-                                    following_fire_time = next_fire_time
+                                following_fire_time = (
+                                    fire_times[i + 1]
+                                    if i + 1 < len(fire_times)
+                                    else next_fire_time
+                                )
 
+                                jitter_bound = max_jitter
                                 if following_fire_time is not None:
                                     # Jitter must never be so high that it would cause a
                                     # fire time to equal or exceed the next fire time
-                                    max_jitter = min(
-                                        [
-                                            max_jitter,
-                                            (
-                                                following_fire_time
-                                                - fire_time
-                                                - _microsecond_delta
-                                            ).total_seconds(),
-                                        ]
+                                    jitter_bound = min(
+                                        jitter_bound,
+                                        (
+                                            following_fire_time
+                                            - fire_time
+                                            - _microsecond_delta
+                                        ).total_seconds(),
                                     )
 
                                 jitter = timedelta(
-                                    seconds=random.uniform(0, max_jitter)
+                                    seconds=self.random_source.uniform(0, jitter_bound)
                                 )
-                                fire_time += jitter
 
+                            # The start deadline is always calculated from the
+                            # original (unjittered) fire time, so that the randomly
+                            # assigned jitter cannot change the misfire boundary
                             if schedule.misfire_grace_time is None:
                                 start_deadline: datetime | None = None
                             else:
@@ -1042,7 +1075,7 @@ class AsyncScheduler:
                                 args=schedule.args,
                                 kwargs=schedule.kwargs,
                                 schedule_id=schedule.id,
-                                scheduled_fire_time=fire_time,
+                                scheduled_fire_time=fire_time + jitter,
                                 jitter=jitter,
                                 start_deadline=start_deadline,
                                 executor=schedule.job_executor,
@@ -1071,9 +1104,7 @@ class AsyncScheduler:
                 if len(schedules) < 100:
                     wakeup_deadline = await self.data_store.get_next_schedule_run_time()
                     if wakeup_deadline:
-                        wait_time = (
-                            wakeup_deadline - datetime.now(timezone.utc)
-                        ).total_seconds()
+                        wait_time = (wakeup_deadline - self.clock()).total_seconds()
                         self.logger.debug(
                             "Sleeping %.3f seconds until the next fire time (%s)",
                             wait_time,
@@ -1178,7 +1209,7 @@ class AsyncScheduler:
     async def _run_job(self, job: Job, func: Callable[..., Any], executor: str) -> None:
         try:
             # Check if the job started before the deadline
-            start_time = datetime.now(timezone.utc)
+            start_time = self.clock()
             if job.start_deadline is not None and start_time > job.start_deadline:
                 result = JobResult.from_job(
                     job, JobOutcome.missed_start_deadline, finished_at=start_time

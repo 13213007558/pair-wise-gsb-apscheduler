@@ -34,6 +34,7 @@ from sqlalchemy import (
     bindparam,
     create_engine,
     false,
+    func,
     or_,
     select,
 )
@@ -750,14 +751,15 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
 
                     # Update schedules
                     if update_args:
-                        extra_values: dict[str, BindParameter] = {}
+                        extra_values: dict[str, Any] = {}
                         p_id: BindParameter = bindparam("p_id")
                         p_trigger: BindParameter = bindparam("p_trigger")
                         p_last_fire_time: BindParameter = bindparam("p_last_fire_time")
                         p_next_fire_time: BindParameter = bindparam("p_next_fire_time")
                         if not self._supports_tzaware_timestamps:
-                            extra_values["last_fire_time_utcoffset"] = bindparam(
-                                "p_last_fire_time_utcoffset"
+                            extra_values["last_fire_time_utcoffset"] = func.coalesce(
+                                bindparam("p_last_fire_time_utcoffset"),
+                                self._t_schedules.c.last_fire_time_utcoffset,
                             )
                             extra_values["next_fire_time_utcoffset"] = bindparam(
                                 "p_next_fire_time_utcoffset"
@@ -773,7 +775,12 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             )
                             .values(
                                 trigger=p_trigger,
-                                last_fire_time=p_last_fire_time,
+                                # A NULL last_fire_time means that the stored value
+                                # should be left unchanged
+                                last_fire_time=func.coalesce(
+                                    p_last_fire_time,
+                                    self._t_schedules.c.last_fire_time,
+                                ),
                                 next_fire_time=p_next_fire_time,
                                 acquired_by=None,
                                 acquired_until=None,

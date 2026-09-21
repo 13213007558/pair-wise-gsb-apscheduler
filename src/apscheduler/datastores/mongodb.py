@@ -446,17 +446,22 @@ class MongoDBDataStore(BaseExternalDataStore):
                 finished_schedule_ids.append(result.schedule_id)
                 continue
 
+            set_fields: dict[str, Any] = {
+                "trigger": serialized_trigger,
+                **marshal_timestamp(result.next_fire_time, "next_fire_time"),
+            }
+            if result.last_fire_time is not None:
+                set_fields.update(
+                    marshal_timestamp(result.last_fire_time, "last_fire_time")
+                )
+
             update = {
                 "$unset": {
                     "acquired_by": True,
                     "acquired_until": True,
                     "acquired_until_utcoffset": True,
                 },
-                "$set": {
-                    "trigger": serialized_trigger,
-                    **marshal_timestamp(result.last_fire_time, "last_fire_time"),
-                    **marshal_timestamp(result.next_fire_time, "next_fire_time"),
-                },
+                "$set": set_fields,
             }
             requests.append(UpdateOne(filters, update))
             updated_schedules.append((result.schedule_id, result.next_fire_time))

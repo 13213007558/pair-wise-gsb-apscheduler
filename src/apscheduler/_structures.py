@@ -247,14 +247,15 @@ class ScheduleResult:
     :ivar schedule_id: ID of the schedule
     :ivar task_id: ID of the schedule's task
     :ivar trigger: the schedule's trigger
-    :ivar last_fire_time: the schedule's trigger
-    :ivar next_fire_time: the next
+    :ivar last_fire_time: the last fire time that was processed (or ``None`` to
+        leave the stored value unchanged)
+    :ivar next_fire_time: the next time the schedule is to be fired
     """
 
     schedule_id: str
     task_id: str
     trigger: Trigger
-    last_fire_time: datetime
+    last_fire_time: datetime | None
     next_fire_time: datetime | None
 
 
@@ -275,6 +276,7 @@ class Job:
         calculated scheduled run time (if the job was derived from a schedule)
     :var ~datetime.datetime | None start_deadline: if the job is started in the
         scheduler after this time, it is considered to be misfired and will be aborted
+        (calculated from the original scheduled time, without jitter)
     :var ~datetime.timedelta result_expiration_time: minimum amount of time to keep the
         result available for fetching in the data store
     :var metadata: key-value pairs for storing JSON compatible custom information
@@ -320,7 +322,13 @@ class Job:
 
     @property
     def original_scheduled_time(self) -> datetime | None:
-        """The scheduled time without any jitter included."""
+        """
+        The original scheduled time, without any jitter included.
+
+        This is the fire time calculated from the schedule's trigger, as opposed to
+        :attr:`scheduled_fire_time` which is the actual (jittered) time the job was
+        scheduled to run at.
+        """
         if self.scheduled_fire_time is None:
             return None
 

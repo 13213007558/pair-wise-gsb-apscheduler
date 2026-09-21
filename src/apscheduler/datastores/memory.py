@@ -183,7 +183,9 @@ class MemoryDataStore(BaseDataStore):
             del self._schedules[index]
 
             # Re-add the schedule to its new position
-            schedule.last_fire_time = result.last_fire_time
+            if result.last_fire_time is not None:
+                schedule.last_fire_time = result.last_fire_time
+
             schedule.next_fire_time = result.next_fire_time
             schedule.acquired_by = None
             schedule.acquired_until = None

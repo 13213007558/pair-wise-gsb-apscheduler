@@ -8,6 +8,7 @@ from contextlib import ExitStack
 from datetime import datetime, timedelta
 from functools import partial
 from logging import Logger
+from random import Random
 from types import TracebackType
 from typing import Any, Literal, overload
 from uuid import UUID
@@ -59,6 +60,8 @@ class Scheduler:
         lease_duration: timedelta = timedelta(seconds=30),
         job_executors: MutableMapping[str, JobExecutor] | None = None,
         task_defaults: TaskDefaults | None = None,
+        random_source: Random | None = None,
+        clock: Callable[[], datetime] | None = None,
         logger: Logger | None = None,
     ):
         kwargs: dict[str, Any] = {}
@@ -70,6 +73,12 @@ class Scheduler:
 
         if logger is not None:
             kwargs["logger"] = logger
+
+        if random_source is not None:
+            kwargs["random_source"] = random_source
+
+        if clock is not None:
+            kwargs["clock"] = clock
 
         if task_defaults is None:
             task_defaults = TaskDefaults()
@@ -128,6 +137,14 @@ class Scheduler:
     @property
     def task_defaults(self) -> TaskDefaults:
         return self._async_scheduler.task_defaults
+
+    @property
+    def random_source(self) -> Random:
+        return self._async_scheduler.random_source
+
+    @property
+    def clock(self) -> Callable[[], datetime]:
+        return self._async_scheduler.clock
 
     @property
     def state(self) -> RunState:

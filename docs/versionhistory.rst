@@ -32,6 +32,15 @@ APScheduler, see the :doc:`migration section <migration>`.
 - Fixed ``CalendarIntervalTrigger`` skipping valid dates or shifting subsequent run dates
   when a nonexistent local time normalizes past midnight during a forward DST shift
 
+- Fixed the randomly assigned jitter of a scheduled job extending its start deadline;
+  the deadline (``scheduled time + misfire_grace_time``) is now always calculated from
+  the original, unjittered fire time so that jitter cannot change the misfire boundary
+- Fixed the jitter upper bound shrinking cumulatively when several missed fire times
+  of the same schedule were processed in a single pass (e.g. after a long pause)
+- Added the ``random_source`` and ``clock`` parameters to ``AsyncScheduler`` and
+  ``Scheduler`` to allow injecting a deterministic randomness source and clock,
+  primarily to make jitter and schedule processing reproducible in tests
+
 **4.0.0a6**
 
 - **BREAKING** Refactored ``AsyncpgEventBroker`` to directly accept a connection string,

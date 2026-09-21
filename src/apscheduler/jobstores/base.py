@@ -16,6 +16,21 @@ class ConflictingIdError(KeyError):
         super().__init__(f"Job identifier ({job_id}) conflicts with an existing job")
 
 
+class ConcurrentModificationError(Exception):
+    """
+    Raised when a job update failed because the job was concurrently modified (or replaced) by
+    another scheduler instance sharing the same job store.
+
+    This is only raised by job stores that implement optimistic concurrency control (see the
+    "optimistic_versioning" option of the SQLAlchemy job store).
+    """
+
+    def __init__(self, job_id):
+        super().__init__(
+            f"Job ({job_id}) was modified concurrently; re-read the job and retry the update"
+        )
+
+
 class TransientJobError(ValueError):
     """
     Raised when an attempt to add transient (with no func_ref) job to a persistent job store is
@@ -122,6 +137,8 @@ class BaseJobStore(metaclass=ABCMeta):
 
         :param Job job: the job to update
         :raises JobLookupError: if the job does not exist
+        :raises ConcurrentModificationError: if the job store implements optimistic concurrency
+            control and the job was concurrently modified by another process
         """
 
     @abstractmethod

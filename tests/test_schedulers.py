@@ -34,7 +34,12 @@ from apscheduler.events import (
 from apscheduler.executors.base import BaseExecutor, MaxInstancesReachedError
 from apscheduler.executors.debug import DebugExecutor
 from apscheduler.job import Job
-from apscheduler.jobstores.base import BaseJobStore, ConflictingIdError, JobLookupError
+from apscheduler.jobstores.base import (
+    BaseJobStore,
+    ConcurrentModificationError,
+    ConflictingIdError,
+    JobLookupError,
+)
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers import (
     SchedulerAlreadyRunningError,
@@ -541,6 +546,51 @@ class TestBaseScheduler:
         event = scheduler._dispatch_event.call_args[0][0]
         assert event.code == EVENT_JOB_MODIFIED
         assert event.jobstore == (None if pending else "default")
+
+    def test_modify_job_retries_on_concurrent_modification(self, scheduler):
+        """
+        Tests that a ConcurrentModificationError from the job store causes the job to be
+        re-read and the changes re-applied instead of overwriting the newer state.
+
+        """
+        job = MagicMock()
+        scheduler._dispatch_event = MagicMock()
+        scheduler._lookup_job = MagicMock(return_value=(job, "default"))
+        jobstore = MagicMock()
+        jobstore.update_job = MagicMock(
+            side_effect=[ConcurrentModificationError("blah"), None]
+        )
+        scheduler._lookup_jobstore = (
+            lambda alias: jobstore if alias == "default" else None
+        )
+
+        scheduler.modify_job("blah", max_instances=2)
+
+        assert scheduler._lookup_job.call_count == 2
+        assert jobstore.update_job.call_count == 2
+        assert scheduler._dispatch_event.call_count == 1
+
+    def test_modify_job_concurrent_modification_exhausted(self, scheduler):
+        """
+        Tests that ConcurrentModificationError is propagated to the caller if the job
+        keeps being concurrently modified.
+
+        """
+        job = MagicMock()
+        scheduler._lookup_job = MagicMock(return_value=(job, "default"))
+        jobstore = MagicMock()
+        jobstore.update_job = MagicMock(
+            side_effect=ConcurrentModificationError("blah")
+        )
+        scheduler._lookup_jobstore = (
+            lambda alias: jobstore if alias == "default" else None
+        )
+
+        pytest.raises(
+            ConcurrentModificationError, scheduler.modify_job, "blah", max_instances=2
+        )
+        assert scheduler._lookup_job.call_count == 3
+        assert jobstore.update_job.call_count == 3
 
     def test_reschedule_job(self, scheduler):
         scheduler.modify_job = MagicMock()
@@ -1106,6 +1156,50 @@ class TestProcessJobs:
         assert scheduler._process_jobs() is None
         job._modify.assert_called_once_with(next_run_time=next_run_time)
         jobstore.update_job.assert_called_once_with(job)
+
+    @pytest.mark.parametrize(
+        "error",
+        [ConcurrentModificationError(999), JobLookupError(999)],
+        ids=["concurrent modification", "already removed"],
+    )
+    def test_job_update_conflict(
+        self, scheduler, job, jobstore, executor, freeze_time, caplog, error
+    ):
+        """
+        Tests that a concurrently modified or removed job does not crash job processing
+        and that the stale snapshot is not written back to the job store.
+
+        """
+        caplog.set_level(logging.INFO)
+        next_run_time = freeze_time.current + timedelta(seconds=6)
+        job.trigger.get_next_fire_time = MagicMock(return_value=next_run_time)
+        jobstore.update_job = MagicMock(side_effect=error)
+
+        assert scheduler._process_jobs() is None
+        jobstore.update_job.assert_called_once_with(job)
+        assert len(caplog.records) == 1
+        assert caplog.records[0].message == (
+            "Not updating job 999 in job store 'default': it was concurrently "
+            "modified or removed"
+        )
+
+    def test_job_remove_after_concurrent_removal(
+        self, scheduler, job, jobstore, executor, caplog
+    ):
+        """
+        Tests that removing a job that another scheduler instance has already removed
+        does not crash job processing.
+
+        """
+        caplog.set_level(logging.INFO)
+        jobstore.remove_job = MagicMock(side_effect=JobLookupError(999))
+
+        assert scheduler._process_jobs() is None
+        jobstore.remove_job.assert_called_once_with(999)
+        assert len(caplog.records) == 1
+        assert caplog.records[0].message == (
+            "Not removing job 999 from job store 'default': it was already removed"
+        )
 
     def test_wait_time(self, scheduler, freeze_time):
         """

@@ -40,6 +40,7 @@ class Job:
     __slots__ = (
         "_scheduler",
         "_jobstore_alias",
+        "_version",
         "id",
         "trigger",
         "executor",
@@ -59,6 +60,7 @@ class Job:
         super().__init__()
         self._scheduler = scheduler
         self._jobstore_alias = None
+        self._version = None
         self._modify(id=id or uuid4().hex, **kwargs)
 
     def modify(self, **changes):
@@ -308,6 +310,9 @@ class Job:
         self.coalesce = state["coalesce"]
         self.max_instances = state["max_instances"]
         self.next_run_time = state["next_run_time"]
+        # The optimistic concurrency version is store-level metadata and is never serialized;
+        # the job store assigns it when the job is loaded.
+        self._version = None
 
     def __eq__(self, other):
         if isinstance(other, Job):

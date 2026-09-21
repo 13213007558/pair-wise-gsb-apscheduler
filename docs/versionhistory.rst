@@ -4,6 +4,18 @@ Version history
 To find out how to migrate your application from a previous version of
 APScheduler, see the :doc:`migration section <migration>`.
 
+**UNRELEASED**
+
+- Added optional optimistic concurrency control to ``SQLAlchemyJobStore``
+  (``optimistic_versioning=True``): a ``version`` column guards every update so that
+  scheduler instances sharing one job store can no longer silently overwrite each
+  other's changes to ``next_run_time``, paused state or trigger. Conflicting updates
+  raise the new ``ConcurrentModificationError`` exception (or are transparently
+  re-read and retried by ``modify_job()`` and friends), and existing tables are
+  migrated automatically on job store startup
+- Fixed the scheduler's job processing loop crashing when a job was concurrently
+  modified or removed by another scheduler instance between retrieval and update
+
 **3.11.0**
 
 - Dropped support for Python 3.6 and 3.7

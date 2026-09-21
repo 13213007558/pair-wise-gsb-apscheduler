@@ -1,7 +1,12 @@
 import pickle
 
 from apscheduler.job import Job
-from apscheduler.jobstores.base import BaseJobStore, ConflictingIdError, JobLookupError
+from apscheduler.jobstores.base import (
+    BaseJobStore,
+    ConcurrentModificationError,
+    ConflictingIdError,
+    JobLookupError,
+)
 from apscheduler.util import (
     datetime_to_utc_timestamp,
     maybe_ref,
@@ -12,15 +17,18 @@ try:
     from sqlalchemy import (
         Column,
         Float,
+        Integer,
         LargeBinary,
         MetaData,
         Table,
         Unicode,
         and_,
         create_engine,
+        inspect,
         select,
+        text,
     )
-    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.exc import IntegrityError, SQLAlchemyError
     from sqlalchemy.sql.expression import null
 except ImportError as exc:  # pragma: nocover
     raise ImportError("SQLAlchemyJobStore requires SQLAlchemy installed") from exc
@@ -46,6 +54,14 @@ class SQLAlchemyJobStore(BaseJobStore):
         should be
     :param dict engine_options: keyword arguments to :func:`~sqlalchemy.create_engine`
         (ignored if ``engine`` is given)
+    :param bool optimistic_versioning: when ``True``, a ``version`` column is maintained on the
+        jobs table and every update is guarded by the version the job was read with, so that a
+        stale snapshot can never silently overwrite a newer state written by another scheduler
+        instance sharing this job store (a
+        :class:`~apscheduler.jobstores.base.ConcurrentModificationError` is raised instead).
+        If the table already exists without the ``version`` column, it is added automatically
+        when the job store is started. Defaults to ``False`` (the historical behavior, no schema
+        changes).
     """
 
     def __init__(
@@ -57,9 +73,11 @@ class SQLAlchemyJobStore(BaseJobStore):
         pickle_protocol=pickle.HIGHEST_PROTOCOL,
         tableschema=None,
         engine_options=None,
+        optimistic_versioning=False,
     ):
         super().__init__()
         self.pickle_protocol = pickle_protocol
+        self.optimistic_versioning = optimistic_versioning
         metadata = maybe_ref(metadata) or MetaData()
 
         if engine:
@@ -71,24 +89,72 @@ class SQLAlchemyJobStore(BaseJobStore):
 
         # 191 = max key length in MySQL for InnoDB/utf8mb4 tables,
         # 25 = precision that translates to an 8-byte float
-        self.jobs_t = Table(
-            tablename,
-            metadata,
+        columns = [
             Column("id", Unicode(191), primary_key=True),
             Column("next_run_time", Float(25), index=True),
             Column("job_state", LargeBinary, nullable=False),
-            schema=tableschema,
-        )
+        ]
+        if optimistic_versioning:
+            columns.append(
+                Column("version", Integer, nullable=False, server_default="0")
+            )
+
+        self.jobs_t = Table(tablename, metadata, *columns, schema=tableschema)
 
     def start(self, scheduler, alias):
         super().start(scheduler, alias)
         self.jobs_t.create(self.engine, True)
+        if self.optimistic_versioning:
+            self._ensure_version_column()
+
+    def _ensure_version_column(self):
+        """
+        Adds the ``version`` column to a pre-existing jobs table if necessary.
+
+        This is the migration path for tables created before optimistic versioning was enabled.
+        If the column cannot be added automatically (e.g. the database dialect does not support
+        ``ALTER TABLE ... ADD COLUMN``), a clear error is raised; the operator can then either
+        add the column manually or keep ``optimistic_versioning`` disabled.
+        """
+        with self.engine.begin() as connection:
+            columns = inspect(connection).get_columns(
+                self.jobs_t.name, schema=self.jobs_t.schema
+            )
+            if any(column["name"] == "version" for column in columns):
+                return
+
+            table_name = connection.dialect.identifier_preparer.format_table(
+                self.jobs_t
+            )
+            try:
+                connection.execute(
+                    text(
+                        f"ALTER TABLE {table_name} "
+                        "ADD COLUMN version INTEGER NOT NULL DEFAULT 0"
+                    )
+                )
+            except SQLAlchemyError as exc:
+                raise RuntimeError(
+                    f"The jobs table {self.jobs_t.name!r} does not have the 'version' column "
+                    "required by optimistic_versioning and it could not be added automatically. "
+                    "Either add the column manually "
+                    "(ALTER TABLE ... ADD COLUMN version INTEGER NOT NULL DEFAULT 0) or disable "
+                    "optimistic_versioning."
+                ) from exc
 
     def lookup_job(self, job_id):
-        selectable = select(self.jobs_t.c.job_state).where(self.jobs_t.c.id == job_id)
+        columns = [self.jobs_t.c.job_state]
+        if self.optimistic_versioning:
+            columns.append(self.jobs_t.c.version)
+
+        selectable = select(*columns).where(self.jobs_t.c.id == job_id)
         with self.engine.begin() as connection:
-            job_state = connection.execute(selectable).scalar()
-            return self._reconstitute_job(job_state) if job_state else None
+            row = connection.execute(selectable).first()
+            if not row:
+                return None
+
+            version = row.version if self.optimistic_versioning else None
+            return self._reconstitute_job(row.job_state, version)
 
     def get_due_jobs(self, now):
         timestamp = datetime_to_utc_timestamp(now)
@@ -111,13 +177,15 @@ class SQLAlchemyJobStore(BaseJobStore):
         return jobs
 
     def add_job(self, job):
-        insert = self.jobs_t.insert().values(
-            **{
-                "id": job.id,
-                "next_run_time": datetime_to_utc_timestamp(job.next_run_time),
-                "job_state": pickle.dumps(job.__getstate__(), self.pickle_protocol),
-            }
-        )
+        values = {
+            "id": job.id,
+            "next_run_time": datetime_to_utc_timestamp(job.next_run_time),
+            "job_state": pickle.dumps(job.__getstate__(), self.pickle_protocol),
+        }
+        if self.optimistic_versioning:
+            values["version"] = 0
+
+        insert = self.jobs_t.insert().values(**values)
         with self.engine.begin() as connection:
             try:
                 connection.execute(insert)
@@ -125,20 +193,35 @@ class SQLAlchemyJobStore(BaseJobStore):
                 raise ConflictingIdError(job.id)
 
     def update_job(self, job):
-        update = (
-            self.jobs_t.update()
-            .values(
-                **{
-                    "next_run_time": datetime_to_utc_timestamp(job.next_run_time),
-                    "job_state": pickle.dumps(job.__getstate__(), self.pickle_protocol),
-                }
-            )
-            .where(self.jobs_t.c.id == job.id)
-        )
+        values = {
+            "next_run_time": datetime_to_utc_timestamp(job.next_run_time),
+            "job_state": pickle.dumps(job.__getstate__(), self.pickle_protocol),
+        }
+        conditions = [self.jobs_t.c.id == job.id]
+        if self.optimistic_versioning:
+            # Optimistic concurrency control: the update only succeeds if the row still
+            # carries the version the job was read with. The version check and the write
+            # happen in a single atomic UPDATE, so no process-level locking is involved.
+            expected_version = job._version or 0
+            values["version"] = expected_version + 1
+            conditions.append(self.jobs_t.c.version == expected_version)
+
+        update = self.jobs_t.update().values(**values).where(and_(*conditions))
         with self.engine.begin() as connection:
             result = connection.execute(update)
             if result.rowcount == 0:
+                if self.optimistic_versioning:
+                    # Distinguish a removed job from a version conflict
+                    selectable = select(self.jobs_t.c.id).where(
+                        self.jobs_t.c.id == job.id
+                    )
+                    if connection.execute(selectable).scalar() is not None:
+                        raise ConcurrentModificationError(job.id)
+
                 raise JobLookupError(job.id)
+
+        if self.optimistic_versioning:
+            job._version = expected_version + 1
 
     def remove_job(self, job_id):
         delete = self.jobs_t.delete().where(self.jobs_t.c.id == job_id)
@@ -155,26 +238,30 @@ class SQLAlchemyJobStore(BaseJobStore):
     def shutdown(self):
         self.engine.dispose()
 
-    def _reconstitute_job(self, job_state):
+    def _reconstitute_job(self, job_state, version=None):
         job_state = pickle.loads(job_state)
         job_state["jobstore"] = self
         job = Job.__new__(Job)
         job.__setstate__(job_state)
         job._scheduler = self._scheduler
         job._jobstore_alias = self._alias
+        job._version = version
         return job
 
     def _get_jobs(self, *conditions):
         jobs = []
-        selectable = select(self.jobs_t.c.id, self.jobs_t.c.job_state).order_by(
-            self.jobs_t.c.next_run_time
-        )
+        columns = [self.jobs_t.c.id, self.jobs_t.c.job_state]
+        if self.optimistic_versioning:
+            columns.append(self.jobs_t.c.version)
+
+        selectable = select(*columns).order_by(self.jobs_t.c.next_run_time)
         selectable = selectable.where(and_(*conditions)) if conditions else selectable
         failed_job_ids = set()
         with self.engine.begin() as connection:
             for row in connection.execute(selectable):
                 try:
-                    jobs.append(self._reconstitute_job(row.job_state))
+                    version = row.version if self.optimistic_versioning else None
+                    jobs.append(self._reconstitute_job(row.job_state, version))
                 except BaseException:
                     self._logger.exception(
                         'Unable to restore job "%s" -- removing it', row.id

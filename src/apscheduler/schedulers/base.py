@@ -33,7 +33,12 @@ from apscheduler.events import (
 from apscheduler.executors.base import BaseExecutor, MaxInstancesReachedError
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.job import Job
-from apscheduler.jobstores.base import BaseJobStore, ConflictingIdError, JobLookupError
+from apscheduler.jobstores.base import (
+    BaseJobStore,
+    ConcurrentModificationError,
+    ConflictingIdError,
+    JobLookupError,
+)
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers import (
     SchedulerAlreadyRunningError,
@@ -570,16 +575,37 @@ class BaseScheduler(metaclass=ABCMeta):
 
         Modifications are passed to this method as extra keyword arguments.
 
+        If the underlying job store uses optimistic concurrency control and the job is
+        concurrently modified by another scheduler instance, the job is re-read and the
+        changes are re-applied, up to a few attempts. If the job keeps changing under
+        contention, :class:`~apscheduler.jobstores.base.ConcurrentModificationError` is
+        raised to the caller.
+
         :param str|unicode job_id: the identifier of the job
         :param str|unicode jobstore: alias of the job store that contains the job
         :return Job: the relevant job instance
 
         """
         with self._jobstores_lock:
-            job, jobstore = self._lookup_job(job_id, jobstore)
-            job._modify(**changes)
-            if jobstore:
-                self._lookup_jobstore(jobstore).update_job(job)
+            for attempt in range(3):
+                job, jobstore = self._lookup_job(job_id, jobstore)
+                job._modify(**changes)
+                if not jobstore:
+                    break
+
+                try:
+                    self._lookup_jobstore(jobstore).update_job(job)
+                except ConcurrentModificationError:
+                    if attempt == 2:
+                        raise
+
+                    self._logger.info(
+                        "Job %s was modified concurrently; re-reading it and "
+                        "retrying the update",
+                        job_id,
+                    )
+                else:
+                    break
 
         self._dispatch_event(JobEvent(EVENT_JOB_MODIFIED, job_id, jobstore))
 
@@ -1226,9 +1252,30 @@ class BaseScheduler(metaclass=ABCMeta):
                         )
                         if job_next_run:
                             job._modify(next_run_time=job_next_run)
-                            jobstore.update_job(job)
+                            try:
+                                jobstore.update_job(job)
+                            except (ConcurrentModificationError, JobLookupError):
+                                # The job was concurrently modified or removed by
+                                # another scheduler instance. The state in the job
+                                # store wins; never overwrite it with this stale
+                                # snapshot.
+                                self._logger.info(
+                                    "Not updating job %s in job store %r: it was "
+                                    "concurrently modified or removed",
+                                    job.id,
+                                    jobstore_alias,
+                                )
                         else:
-                            self.remove_job(job.id, jobstore_alias)
+                            try:
+                                self.remove_job(job.id, jobstore_alias)
+                            except JobLookupError:
+                                # Another scheduler instance already removed it
+                                self._logger.info(
+                                    "Not removing job %s from job store %r: it "
+                                    "was already removed",
+                                    job.id,
+                                    jobstore_alias,
+                                )
 
                 # Set a new next wakeup time if there isn't one yet or
                 # the jobstore has an even earlier one

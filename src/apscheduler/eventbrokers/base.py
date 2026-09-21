@@ -67,18 +67,28 @@ class BaseEventBroker(EventBroker):
 
     async def publish_local(self, event: Event) -> None:
         event_type = type(event)
-        one_shot_tokens: list[object] = []
-        for subscription in self._subscriptions.values():
+        matched: list[LocalSubscription] = []
+        for subscription in list(self._subscriptions.values()):
             if (
-                subscription.event_types is None
-                or event_type in subscription.event_types
+                subscription.event_types is not None
+                and event_type not in subscription.event_types
             ):
-                self._task_group.start_soon(self._deliver_event, subscription, event)
-                if subscription.one_shot:
-                    one_shot_tokens.append(subscription.token)
+                continue
 
-        for token in one_shot_tokens:
-            self.unsubscribe(token)
+            if subscription.one_shot:
+                # Atomically claim the subscription before scheduling delivery.
+                # This ensures that no concurrent or reentrant publish can select
+                # it again while its callback is still running, and that a
+                # cancelled delivery cannot remove a later, re-established
+                # subscription.
+                claimed = self._subscriptions.pop(subscription.token, None)
+                if claimed is not subscription:
+                    continue
+
+            matched.append(subscription)
+
+        for subscription in matched:
+            self._task_group.start_soon(self._deliver_event, subscription, event)
 
     async def _deliver_event(
         self, subscription: LocalSubscription, event: Event

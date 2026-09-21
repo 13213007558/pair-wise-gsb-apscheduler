@@ -131,7 +131,8 @@ class MQTTEventBroker(BaseExternalEventBroker):
             self._portal.call(self.publish_local, event)
 
     async def publish(self, event: Event) -> None:
-        notification = self.generate_notification(event)
-        await to_thread.run_sync(
-            lambda: self._client.publish(self.topic, notification, qos=self.publish_qos)
-        )
+        for notification in self.generate_notifications(event):
+            await to_thread.run_sync(self._publish, notification)
+
+    def _publish(self, payload: bytes) -> object:
+        return self._client.publish(self.topic, payload, qos=self.publish_qos)

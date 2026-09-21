@@ -17,6 +17,12 @@ from .._exceptions import DeserializationError
 from .._retry import RetryMixin
 from ..abc import EventBroker, Serializer, Subscription
 from ..serializers.json import JSONSerializer
+from ._envelope import (
+    EnvelopeError,
+    FragmentReassembler,
+    fragment_payload,
+    is_envelope,
+)
 
 
 @attrs.define(eq=False, frozen=True)
@@ -104,9 +110,43 @@ class BaseExternalEventBroker(BaseEventBroker, RetryMixin):
     Base class for event brokers that use an external service.
 
     :param serializer: the serializer used to (de)serialize events for transport
+    :param max_notification_size: maximum size, in bytes/characters, of a single
+        transport notification. Notifications larger than this are transparently
+        split into versioned envelope fragments. ``None`` (the default) disables
+        fragmentation and keeps the legacy single-packet wire format forever.
+        The PostgreSQL-based brokers default this to 7999 to stay within the
+        ``NOTIFY`` payload limit.
+    :param max_payload_size: maximum accepted size, in bytes, of a serialized
+        event payload, on both the sending and the receiving side
+    :param max_fragments: maximum number of fragments a single event may consist
+        of
+    :param fragment_reassembly_timeout: maximum time, in seconds, the receiver
+        buffers fragments of an incomplete event before discarding them
+    :param max_buffered_events: maximum number of incomplete events the receiver
+        buffers concurrently, bounding reassembly memory use
     """
 
     serializer: Serializer = attrs.field(factory=JSONSerializer)
+    max_notification_size: int | None = attrs.field(default=None)
+    max_payload_size: int = attrs.field(default=1024 * 1024)
+    max_fragments: int = attrs.field(default=1024)
+    fragment_reassembly_timeout: float = attrs.field(default=10.0)
+    max_buffered_events: int = attrs.field(default=1000)
+
+    _reassembler: FragmentReassembler = attrs.field(init=False, eq=False)
+
+    @_reassembler.default
+    def _create_reassembler(self) -> FragmentReassembler:
+        return FragmentReassembler(
+            max_events=self.max_buffered_events,
+            max_payload_size=self.max_payload_size,
+            max_fragments=self.max_fragments,
+            timeout=self.fragment_reassembly_timeout,
+        )
+
+    def _serialize_event(self, event: Event) -> tuple[str, bytes]:
+        event_type = event.__class__.__name__
+        return event_type, self.serializer.serialize(event.marshal())
 
     def generate_notification(self, event: Event) -> bytes:
         serialized = self.serializer.serialize(event.marshal())
@@ -115,6 +155,52 @@ class BaseExternalEventBroker(BaseEventBroker, RetryMixin):
     def generate_notification_str(self, event: Event) -> str:
         serialized = self.serializer.serialize(event.marshal())
         return event.__class__.__name__ + " " + b64encode(serialized).decode("ascii")
+
+    def generate_notifications(self, event: Event) -> list[bytes]:
+        """
+        Generate one or more transport notifications for the event.
+
+        Small events are encoded as a single legacy format notification
+        (``EventType <serialized>``) which old clients understand. Events that
+        would not fit in a single packet are split into versioned envelope
+        fragments instead.
+        """
+        event_type, serialized = self._serialize_event(event)
+        legacy = event_type.encode("ascii") + b" " + serialized
+        if (
+            self.max_notification_size is None
+            or len(legacy) <= self.max_notification_size
+        ):
+            return [legacy]
+
+        return [
+            line.encode("ascii")
+            for line in fragment_payload(
+                event_type,
+                serialized,
+                self.max_notification_size,
+                self.max_payload_size,
+                self.max_fragments,
+            )
+        ]
+
+    def generate_notifications_str(self, event: Event) -> list[str]:
+        """String variant of :meth:`generate_notifications`."""
+        event_type, serialized = self._serialize_event(event)
+        legacy = event_type + " " + b64encode(serialized).decode("ascii")
+        if (
+            self.max_notification_size is None
+            or len(legacy) <= self.max_notification_size
+        ):
+            return [legacy]
+
+        return fragment_payload(
+            event_type,
+            serialized,
+            self.max_notification_size,
+            self.max_payload_size,
+            self.max_fragments,
+        )
 
     def _reconstitute_event(self, event_type: str, serialized: bytes) -> Event | None:
         try:
@@ -144,6 +230,11 @@ class BaseExternalEventBroker(BaseEventBroker, RetryMixin):
             return None
 
     def reconstitute_event(self, payload: bytes) -> Event | None:
+        if is_envelope(payload):
+            return self._reconstitute_enveloped(
+                payload.decode("ascii", errors="replace")
+            )
+
         try:
             event_type_bytes, serialized = payload.split(b" ", 1)
         except ValueError:
@@ -156,6 +247,9 @@ class BaseExternalEventBroker(BaseEventBroker, RetryMixin):
         return self._reconstitute_event(event_type, serialized)
 
     def reconstitute_event_str(self, payload: str) -> Event | None:
+        if is_envelope(payload):
+            return self._reconstitute_enveloped(payload)
+
         try:
             event_type, b64_serialized = payload.split(" ", 1)
         except ValueError:
@@ -165,3 +259,19 @@ class BaseExternalEventBroker(BaseEventBroker, RetryMixin):
             return None
 
         return self._reconstitute_event(event_type, b64decode(b64_serialized))
+
+    def _reconstitute_enveloped(self, payload: str) -> Event | None:
+        try:
+            result = self._reassembler.receive(payload)
+        except EnvelopeError:
+            self._logger.exception(
+                "Received malformed event envelope",
+                extra={"payload": payload},
+            )
+            return None
+
+        if result is None:
+            return None
+
+        event_type, serialized = result
+        return self._reconstitute_event(event_type, serialized)

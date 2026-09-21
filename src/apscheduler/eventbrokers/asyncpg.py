@@ -18,7 +18,6 @@ from asyncpg import Connection, InterfaceError
 from attr.validators import instance_of
 
 from .._events import Event
-from .._exceptions import SerializationError
 from .._utils import create_repr
 from .base import BaseExternalEventBroker
 
@@ -48,6 +47,7 @@ class AsyncpgEventBroker(BaseExternalEventBroker):
     )
     channel: str = attrs.field(kw_only=True, default="apscheduler")
     max_idle_time: float = attrs.field(kw_only=True, default=10)
+    max_notification_size: int | None = attrs.field(kw_only=True, default=7999)
 
     _send: MemoryObjectSendStream[str] = attrs.field(init=False)
 
@@ -156,10 +156,5 @@ class AsyncpgEventBroker(BaseExternalEventBroker):
                         self._logger.error("Connection error: %s", exc)
 
     async def publish(self, event: Event) -> None:
-        notification = self.generate_notification_str(event)
-        if len(notification) > 7999:
-            raise SerializationError(
-                "Serialized event object exceeds 7999 bytes in size"
-            )
-
-        await self._send.send(notification)
+        for notification in self.generate_notifications_str(event):
+            await self._send.send(notification)

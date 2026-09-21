@@ -6,6 +6,14 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **UNRELEASED**
 
+- Added a versioned, fragmented notification envelope to the external event
+  brokers, so that events larger than the transport packet limit (such as
+  PostgreSQL ``NOTIFY``'s 8000-byte payload) are delivered intact. Small events
+  continue to use the legacy single-packet format, so older clients remain
+  compatible. Fragment reassembly is bounded by configurable fragment counts,
+  payload sizes, buffer capacity and timeouts; duplicate fragments or whole-event
+  redelivery (e.g. from Redis/asyncpg retries) no longer cause duplicate
+  callbacks
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+

@@ -17,7 +17,6 @@ from attr.validators import instance_of
 from psycopg import AsyncConnection, InterfaceError
 
 from .._events import Event
-from .._exceptions import SerializationError
 from .._utils import create_repr
 from .._validators import positive_number
 from .base import BaseExternalEventBroker
@@ -57,6 +56,7 @@ class PsycopgEventBroker(BaseExternalEventBroker):
     max_idle_time: float = attrs.field(
         kw_only=True, default=10, validator=[instance_of((int, float)), positive_number]
     )
+    max_notification_size: int | None = attrs.field(kw_only=True, default=7999)
 
     _send: MemoryObjectSendStream[str] = attrs.field(init=False)
 
@@ -168,10 +168,5 @@ class PsycopgEventBroker(BaseExternalEventBroker):
                             await conn.execute("SELECT 1")
 
     async def publish(self, event: Event) -> None:
-        notification = self.generate_notification_str(event)
-        if len(notification) > 7999:
-            raise SerializationError(
-                "Serialized event object exceeds 7999 bytes in size"
-            )
-
-        await self._send.send(notification)
+        for notification in self.generate_notifications_str(event):
+            await self._send.send(notification)

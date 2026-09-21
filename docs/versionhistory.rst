@@ -32,6 +32,10 @@ APScheduler, see the :doc:`migration section <migration>`.
 - Fixed ``CalendarIntervalTrigger`` skipping valid dates or shifting subsequent run dates
   when a nonexistent local time normalizes past midnight during a forward DST shift
 
+- Fixed ``get_job_result(wait=True)`` waiting forever when the scheduler was
+  stopped before the job could finish; the wait now ends and returns ``None``
+  in that case
+
 **4.0.0a6**
 
 - **BREAKING** Refactored ``AsyncpgEventBroker`` to directly accept a connection string,

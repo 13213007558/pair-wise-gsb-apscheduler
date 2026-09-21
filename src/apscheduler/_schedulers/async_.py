@@ -730,7 +730,8 @@ class AsyncScheduler:
             ``False`` to raise an exception if the result is not yet available
         :returns: the job result, or ``None`` if the job finished but didn't record a
             result (``result_expiration_time`` was 0 or a similarly short time interval
-            that did not allow for the result to be fetched before it was deleted)
+            that did not allow for the result to be fetched before it was deleted), or
+            the scheduler was stopped before the job could finish
         :raises JobLookupError: if neither the job or its result exist in the data
             store, or the job exists but the result is not ready yet and ``wait=False``
             is set
@@ -739,11 +740,11 @@ class AsyncScheduler:
         self._check_initialized()
         wait_event = anyio.Event()
 
-        def listener(event: JobReleased) -> None:
-            if event.job_id == job_id:
+        def listener(event: JobReleased | SchedulerStopped) -> None:
+            if isinstance(event, SchedulerStopped) or event.job_id == job_id:
                 wait_event.set()
 
-        with self.event_broker.subscribe(listener, {JobReleased}):
+        with self.event_broker.subscribe(listener, {JobReleased, SchedulerStopped}):
             job_exists = bool(await self.data_store.get_jobs([job_id]))
             if result := await self.data_store.get_job_result(job_id):
                 return result

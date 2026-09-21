@@ -5,8 +5,8 @@ import sys
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable
-from contextlib import AsyncExitStack
+from collections.abc import AsyncGenerator, Callable, Coroutine, Iterable
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from inspect import signature
@@ -14,14 +14,17 @@ from queue import Queue
 from types import ModuleType
 from typing import Any, cast
 from unittest.mock import patch
+from uuid import UUID
 
 import anyio
 import attrs
 import pytest
 from anyio import (
+    CancelScope,
     Lock,
     WouldBlock,
     create_memory_object_stream,
+    create_task_group,
     fail_after,
     move_on_after,
     sleep,
@@ -39,6 +42,7 @@ from apscheduler import (
     JobLookupError,
     JobOutcome,
     JobReleased,
+    JobResult,
     RunState,
     ScheduleAdded,
     ScheduleLookupError,
@@ -55,7 +59,7 @@ from apscheduler import (
     current_job,
     task,
 )
-from apscheduler.abc import DataStore
+from apscheduler.abc import DataStore, Subscription
 from apscheduler.datastores.base import BaseExternalDataStore
 from apscheduler.datastores.memory import MemoryDataStore
 from apscheduler.eventbrokers.local import LocalEventBroker
@@ -130,6 +134,94 @@ class DummyClass:
 
     def __call__(self) -> int:
         return self.value
+
+
+def get_broker_state(scheduler: AsyncScheduler) -> tuple[int, int]:
+    """Return the event broker's (subscription count, task count) state."""
+    broker = cast(LocalEventBroker, scheduler.event_broker)
+    task_group = cast(Any, broker._task_group)
+    return len(broker._subscriptions), len(task_group._tasks)
+
+
+async def wait_for_broker_state(
+    scheduler: AsyncScheduler, expected: tuple[int, int]
+) -> None:
+    """Wait until the event broker's state matches the expected baseline."""
+    for _ in range(300):
+        if get_broker_state(scheduler) == expected:
+            return
+
+        await sleep(0.01)
+
+    pytest.fail(f"the event broker state did not return to {expected}")
+
+
+async def settled_broker_state(scheduler: AsyncScheduler) -> tuple[int, int]:
+    """Return the event broker's state once it has stopped changing."""
+    previous: tuple[int, int] | None = None
+    for _ in range(60):
+        current = get_broker_state(scheduler)
+        if current == previous:
+            return current
+
+        previous = current
+        await sleep(0.05)
+
+    pytest.fail("the event broker state did not settle")
+
+
+@asynccontextmanager
+async def subscription_barrier(
+    scheduler: AsyncScheduler,
+) -> AsyncGenerator[Callable[[int], Coroutine[Any, Any, None]], Any]:
+    """
+    Provide an event barrier that fires when the event broker's subscription
+    count reaches the number passed to the returned callable.
+
+    """
+    broker = cast(LocalEventBroker, scheduler.event_broker)
+    real_subscribe = broker.subscribe
+    real_unsubscribe = broker.unsubscribe
+    target_count = 0
+    count_reached = anyio.Event()
+
+    def check_count() -> None:
+        if len(broker._subscriptions) == target_count:
+            count_reached.set()
+
+    def subscribe(*args: Any, **kwargs: Any) -> Subscription:
+        subscription = real_subscribe(*args, **kwargs)
+        check_count()
+        return subscription
+
+    def unsubscribe(token: object) -> None:
+        real_unsubscribe(token)
+        check_count()
+
+    async def wait_for_subscription_count(count: int) -> None:
+        nonlocal target_count, count_reached
+        target_count = count
+        count_reached = anyio.Event()
+        check_count()
+        with fail_after(3):
+            await count_reached.wait()
+
+    with (
+        patch.object(broker, "subscribe", subscribe),
+        patch.object(broker, "unsubscribe", unsubscribe),
+    ):
+        yield wait_for_subscription_count
+
+
+async def complete_job(scheduler: AsyncScheduler, job: Job) -> None:
+    """Simulate the completion of a job: store its result and publish the event."""
+    result = JobResult.from_job(
+        job,
+        JobOutcome.success,
+        started_at=datetime.now(timezone.utc),
+        return_value="returnvalue",
+    )
+    await scheduler.data_store.release_job(scheduler.identity, job, result)
 
 
 class TestAsyncScheduler:
@@ -762,6 +854,460 @@ class TestAsyncScheduler:
 
             with pytest.raises(JobLookupError), fail_after(1):
                 await scheduler.get_job_result(job_id, wait=False)
+
+    async def test_get_job_result_completion_races_with_subscription(
+        self, raw_datastore: DataStore
+    ) -> None:
+        """
+        Test that a job completing at the same time as a waiter subscribes to
+        completion events is still detected by the waiter.
+
+        """
+        async with AsyncScheduler(data_store=raw_datastore) as scheduler:
+            job_id = await scheduler.add_job(
+                dummy_async_job, result_expiration_time=timedelta(minutes=1)
+            )
+            job = (await scheduler.get_jobs())[0]
+            baseline = get_broker_state(scheduler)
+
+            # Inject the job's completion into the waiter's initial data store
+            # check, right after the waiter has subscribed to events
+            real_get_jobs = scheduler.data_store.get_jobs
+            completion_injected = False
+
+            async def get_jobs_with_injected_completion(
+                ids: Iterable[UUID] | None = None,
+            ) -> list[Job]:
+                nonlocal completion_injected
+                jobs = await real_get_jobs(ids)
+                if not completion_injected and ids and job.id in ids:
+                    completion_injected = True
+                    await complete_job(scheduler, job)
+
+                return jobs
+
+            with patch.object(
+                scheduler.data_store, "get_jobs", get_jobs_with_injected_completion
+            ):
+                with fail_after(3):
+                    result = await scheduler.get_job_result(job_id)
+
+            assert completion_injected
+            assert result is not None
+            assert result.job_id == job_id
+            assert result.outcome is JobOutcome.success
+            assert result.return_value == "returnvalue"
+            await wait_for_broker_state(scheduler, baseline)
+
+    async def test_get_job_result_timeout(self) -> None:
+        """
+        Test that a caller-side timeout cleanly cancels the wait, and that a
+        retry after the timeout still works.
+
+        """
+        async with AsyncScheduler() as scheduler:
+            job_id = await scheduler.add_job(
+                dummy_async_job, result_expiration_time=timedelta(minutes=1)
+            )
+            job = (await scheduler.get_jobs())[0]
+            baseline = get_broker_state(scheduler)
+
+            # The deadline has already expired when the wait begins
+            with move_on_after(0) as scope:
+                await scheduler.get_job_result(job_id)
+
+            assert scope.cancelled_caught
+
+            # The job does not finish within the timeout
+            with move_on_after(0.1) as scope:
+                await scheduler.get_job_result(job_id)
+
+            assert scope.cancelled_caught
+            await wait_for_broker_state(scheduler, baseline)
+
+            # A retry after the timeouts must still pick up the result
+            await complete_job(scheduler, job)
+            with fail_after(3):
+                result = await scheduler.get_job_result(job_id)
+
+            assert result is not None
+            assert result.outcome is JobOutcome.success
+            await wait_for_broker_state(scheduler, baseline)
+
+    async def test_get_job_result_cancellation(self) -> None:
+        """
+        Test that cancelling the caller of get_job_result() removes the
+        waiter's event subscription and does not consume the completion event.
+
+        """
+        async with AsyncScheduler() as scheduler:
+            job_id = await scheduler.add_job(
+                dummy_async_job, result_expiration_time=timedelta(minutes=1)
+            )
+            job = (await scheduler.get_jobs())[0]
+            baseline = get_broker_state(scheduler)
+            cancel_scope = CancelScope()
+
+            async def waiter() -> None:
+                with cancel_scope:
+                    await scheduler.get_job_result(job_id)
+
+            async with subscription_barrier(scheduler) as wait_for_count:
+                async with create_task_group() as task_group:
+                    task_group.start_soon(waiter)
+
+                    # Wait for the waiter to register its subscription, then
+                    # cancel it
+                    await wait_for_count(baseline[0] + 1)
+                    cancel_scope.cancel()
+
+            assert cancel_scope.cancelled_caught
+            await wait_for_broker_state(scheduler, baseline)
+
+            # The cancelled waiter must not have consumed the completion event
+            await complete_job(scheduler, job)
+            with fail_after(3):
+                result = await scheduler.get_job_result(job_id)
+
+            assert result is not None
+            assert result.outcome is JobOutcome.success
+            await wait_for_broker_state(scheduler, baseline)
+
+    async def test_get_job_result_concurrent_waiters(self) -> None:
+        """
+        Test that each concurrent waiter for the same job can time out or be
+        cancelled independently, without disturbing the other waiters.
+
+        """
+        async with AsyncScheduler() as scheduler:
+            job_id = await scheduler.add_job(
+                dummy_async_job, result_expiration_time=timedelta(minutes=1)
+            )
+            job = (await scheduler.get_jobs())[0]
+            baseline = get_broker_state(scheduler)
+            cancel_scope = CancelScope()
+            results: list[JobResult | None] = []
+
+            async def plain_waiter() -> None:
+                with fail_after(3):
+                    results.append(await scheduler.get_job_result(job_id))
+
+            async def timed_out_waiter() -> None:
+                with move_on_after(0.1):
+                    await scheduler.get_job_result(job_id)
+
+            async def cancelled_waiter() -> None:
+                with cancel_scope:
+                    await scheduler.get_job_result(job_id)
+
+            async with subscription_barrier(scheduler) as wait_for_count:
+                async with create_task_group() as task_group:
+                    task_group.start_soon(plain_waiter)
+                    task_group.start_soon(timed_out_waiter)
+                    task_group.start_soon(cancelled_waiter)
+
+                    # Wait for all three waiters to register their
+                    # subscriptions
+                    await wait_for_count(baseline[0] + 3)
+
+                    # The timed-out and cancelled waiters exit on their own
+                    # terms, leaving the remaining waiter undisturbed
+                    cancel_scope.cancel()
+                    await wait_for_count(baseline[0] + 1)
+
+                    # Complete the job; the completion event must wake the
+                    # remaining waiter even though the other waiters already
+                    # left
+                    await complete_job(scheduler, job)
+
+            assert cancel_scope.cancelled_caught
+            assert len(results) == 1
+            assert results[0] is not None
+            assert results[0].outcome is JobOutcome.success
+            assert results[0].return_value == "returnvalue"
+            await wait_for_broker_state(scheduler, baseline)
+
+    async def test_get_job_result_concurrent_waiters_completion(self) -> None:
+        """
+        Test that the completion event wakes up all concurrent waiters, even
+        though only one of them can fetch the stored result.
+
+        """
+        async with AsyncScheduler() as scheduler:
+            job_id = await scheduler.add_job(
+                dummy_async_job, result_expiration_time=timedelta(minutes=1)
+            )
+            job = (await scheduler.get_jobs())[0]
+            baseline = get_broker_state(scheduler)
+            results: list[JobResult | None] = []
+
+            async def waiter() -> None:
+                with fail_after(3):
+                    results.append(await scheduler.get_job_result(job_id))
+
+            async with subscription_barrier(scheduler) as wait_for_count:
+                async with create_task_group() as task_group:
+                    for _ in range(3):
+                        task_group.start_soon(waiter)
+
+                    # Wait for all the waiters to register their subscriptions
+                    await wait_for_count(baseline[0] + 3)
+
+                    await complete_job(scheduler, job)
+
+            # All waiters woke up, but the result could only be fetched once
+            assert len(results) == 3
+            assert sum(result is not None for result in results) == 1
+            result = next(result for result in results if result is not None)
+            assert result.outcome is JobOutcome.success
+            assert result.return_value == "returnvalue"
+            await wait_for_broker_state(scheduler, baseline)
+
+    async def test_get_job_result_wait_after_completion(self) -> None:
+        """
+        Test that waiting for an already completed job reads the result
+        straight from the data store instead of waiting for an event.
+
+        """
+        async with AsyncScheduler() as scheduler:
+            send, receive = create_memory_object_stream[Event](1)
+            with send, receive:
+                subscription = scheduler.subscribe(send.send, {JobReleased})
+                await scheduler.start_in_background()
+                job_id = await scheduler.add_job(
+                    dummy_async_job, result_expiration_time=timedelta(minutes=1)
+                )
+
+                # Wait for the job to complete before waiting for its result
+                with fail_after(3):
+                    event = await receive.receive()
+
+                assert isinstance(event, JobReleased)
+                assert event.job_id == job_id
+                subscription.unsubscribe()
+                baseline = await settled_broker_state(scheduler)
+
+                # The result must come straight from the data store
+                with fail_after(3):
+                    result = await scheduler.get_job_result(job_id)
+
+                assert result is not None
+                assert result.job_id == job_id
+                assert result.outcome is JobOutcome.success
+                assert result.return_value == "returnvalue"
+                await wait_for_broker_state(scheduler, baseline)
+
+    async def test_get_job_result_repeated_waits(self) -> None:
+        """
+        Test that repeated waits for job results each clean up after
+        themselves, and that re-waiting for a consumed result fails instead
+        of hanging.
+
+        """
+        async with AsyncScheduler() as scheduler:
+            await scheduler.start_in_background()
+            baseline = await settled_broker_state(scheduler)
+
+            job_id = await scheduler.add_job(
+                dummy_async_job, result_expiration_time=timedelta(minutes=1)
+            )
+            with fail_after(3):
+                result = await scheduler.get_job_result(job_id)
+
+            assert result is not None
+            assert result.outcome is JobOutcome.success
+            await wait_for_broker_state(scheduler, baseline)
+
+            # The result was consumed by the first wait, so waiting again
+            # must fail immediately rather than hang
+            with pytest.raises(JobLookupError), fail_after(3):
+                await scheduler.get_job_result(job_id)
+
+            await wait_for_broker_state(scheduler, baseline)
+
+            # Waiting for another job must still work afterwards
+            job_id2 = await scheduler.add_job(
+                dummy_async_job, result_expiration_time=timedelta(minutes=1)
+            )
+            with fail_after(3):
+                result2 = await scheduler.get_job_result(job_id2)
+
+            assert result2 is not None
+            assert result2.job_id == job_id2
+            assert result2.outcome is JobOutcome.success
+            await wait_for_broker_state(scheduler, baseline)
+
+    async def test_get_job_result_result_expires(self) -> None:
+        """
+        Test that get_job_result() returns None if the job's result expired
+        before it could be fetched, and raises JobLookupError once both the
+        job and its result are gone.
+
+        """
+        async with AsyncScheduler() as scheduler:
+            job_id = await scheduler.add_job(
+                dummy_async_job,
+                result_expiration_time=timedelta(milliseconds=50),
+            )
+            job = (await scheduler.get_jobs())[0]
+            baseline = get_broker_state(scheduler)
+
+            # Simulate the result expiring right after the completion event
+            # woke up the waiter, but before the waiter fetched the result
+            real_get_job_result = scheduler.data_store.get_job_result
+            store_checks = 0
+            initial_store_check = anyio.Event()
+
+            async def get_job_result_with_expiry(
+                job_id_: UUID,
+            ) -> JobResult | None:
+                nonlocal store_checks
+                store_checks += 1
+                initial_store_check.set()
+                if store_checks > 1:
+                    await sleep(0.2)
+                    await scheduler.data_store.cleanup()
+
+                return await real_get_job_result(job_id_)
+
+            fetched_results: list[JobResult | None] = []
+            with patch.object(
+                scheduler.data_store, "get_job_result", get_job_result_with_expiry
+            ):
+                async with create_task_group() as task_group:
+
+                    async def waiter() -> None:
+                        with fail_after(3):
+                            fetched_results.append(
+                                await scheduler.get_job_result(job_id)
+                            )
+
+                    task_group.start_soon(waiter)
+
+                    # Wait for the waiter's initial store check, then complete
+                    # the job
+                    with fail_after(3):
+                        await initial_store_check.wait()
+
+                    await complete_job(scheduler, job)
+
+            assert fetched_results == [None]
+            await wait_for_broker_state(scheduler, baseline)
+
+            # The result has been cleaned up, so there is nothing to wait for
+            with pytest.raises(JobLookupError), fail_after(3):
+                await scheduler.get_job_result(job_id)
+
+            await wait_for_broker_state(scheduler, baseline)
+
+    async def test_get_job_result_result_expired_before_wait(self) -> None:
+        """
+        Test that get_job_result() raises JobLookupError if the job's result
+        already expired before the wait began.
+
+        """
+        async with AsyncScheduler() as scheduler:
+            job_id = await scheduler.add_job(
+                dummy_async_job,
+                result_expiration_time=timedelta(milliseconds=50),
+            )
+            job = (await scheduler.get_jobs())[0]
+            baseline = get_broker_state(scheduler)
+
+            # Complete the job and wait for its result to expire
+            await complete_job(scheduler, job)
+            await sleep(0.1)
+            await scheduler.cleanup()
+
+            with pytest.raises(JobLookupError), fail_after(3):
+                await scheduler.get_job_result(job_id, wait=False)
+
+            with pytest.raises(JobLookupError), fail_after(3):
+                await scheduler.get_job_result(job_id)
+
+            await wait_for_broker_state(scheduler, baseline)
+
+    async def test_get_job_result_scheduler_stop_with_running_job(self) -> None:
+        """
+        Test that a waiter is released with the job's (cancelled) result when
+        the scheduler is stopped while the job is still running.
+
+        """
+        gate = anyio.Event()
+
+        async def gated_job() -> str:
+            await gate.wait()
+            return "returnvalue"
+
+        async with AsyncScheduler() as scheduler:
+            await scheduler.configure_task("gated", func=gated_job)
+            send, receive = create_memory_object_stream[Event](4)
+            with send, receive:
+                subscription = scheduler.subscribe(send.send, {JobAcquired})
+                await scheduler.start_in_background()
+                job_id = await scheduler.add_job(
+                    "gated", result_expiration_time=timedelta(minutes=1)
+                )
+
+                # Wait for the job to start running
+                with fail_after(3):
+                    event = await receive.receive()
+
+                assert isinstance(event, JobAcquired)
+                assert event.job_id == job_id
+                baseline = await settled_broker_state(scheduler)
+
+                results: list[JobResult | None] = []
+
+                async def waiter() -> None:
+                    with fail_after(3):
+                        results.append(await scheduler.get_job_result(job_id))
+
+                async with subscription_barrier(scheduler) as wait_for_count:
+                    async with create_task_group() as task_group:
+                        task_group.start_soon(waiter)
+
+                        # Stop the scheduler while the waiter is waiting
+                        await wait_for_count(baseline[0] + 1)
+                        await scheduler.stop()
+
+                # The cancelled job's result was delivered to the waiter
+                assert len(results) == 1
+                assert results[0] is not None
+                assert results[0].outcome is JobOutcome.cancelled
+                subscription.unsubscribe()
+                await wait_for_broker_state(scheduler, (0, 0))
+
+    async def test_get_job_result_scheduler_stop_with_pending_job(self) -> None:
+        """
+        Test that a waiter is released (with a None result) when the
+        scheduler is stopped before the job could run.
+
+        """
+        async with AsyncScheduler(role=SchedulerRole.scheduler) as scheduler:
+            await scheduler.start_in_background()
+            job_id = await scheduler.add_job(
+                dummy_async_job, result_expiration_time=timedelta(minutes=1)
+            )
+            baseline = await settled_broker_state(scheduler)
+
+            results: list[JobResult | None] = []
+
+            async def waiter() -> None:
+                with fail_after(3):
+                    results.append(await scheduler.get_job_result(job_id))
+
+            async with subscription_barrier(scheduler) as wait_for_count:
+                async with create_task_group() as task_group:
+                    task_group.start_soon(waiter)
+
+                    # Stop the scheduler while the waiter is waiting
+                    await wait_for_count(baseline[0] + 1)
+                    await scheduler.stop()
+
+            # The job never ran, so there is no result to return
+            assert results == [None]
+            await wait_for_broker_state(scheduler, (0, 0))
 
     async def test_add_job_not_rewriting_task_config(
         self, raw_datastore: DataStore

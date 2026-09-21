@@ -4,8 +4,8 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable, Iterable
 from collections import defaultdict
-from collections.abc import Callable
 from contextlib import AsyncExitStack
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -19,8 +19,10 @@ import anyio
 import attrs
 import pytest
 from anyio import (
+    CancelScope,
     Lock,
     WouldBlock,
+    create_task_group,
     create_memory_object_stream,
     fail_after,
     move_on_after,
@@ -39,6 +41,7 @@ from apscheduler import (
     JobLookupError,
     JobOutcome,
     JobReleased,
+    JobResult,
     RunState,
     ScheduleAdded,
     ScheduleLookupError,
@@ -91,6 +94,78 @@ def dummy_sync_job(delay: float = 0, fail: bool = False) -> str:
         raise RuntimeError("failing as requested")
     else:
         return "returnvalue"
+
+
+class TrackingEventBroker(LocalEventBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.wait_subscriptions = 0
+        self.pending_deliveries = 0
+
+    def subscribe(
+        self,
+        callback: Callable[..., Any],
+        event_types: Iterable[type[Event]] | None = None,
+        *,
+        is_async: bool = True,
+        one_shot: bool = False,
+    ):
+        subscription = super().subscribe(
+            callback,
+            event_types,
+            is_async=is_async,
+            one_shot=one_shot,
+        )
+        if subscription.event_types == {JobReleased, SchedulerStopped}:
+            self.wait_subscriptions += 1
+
+        return subscription
+
+    def unsubscribe(self, token: object) -> None:
+        subscription = self._subscriptions.get(token)
+        if subscription and subscription.event_types == {
+            JobReleased,
+            SchedulerStopped,
+        }:
+            self.wait_subscriptions -= 1
+
+        super().unsubscribe(token)
+
+    async def _deliver_tracked_event(self, subscription: Any, event: Event) -> None:
+        try:
+            await self._deliver_event(subscription, event)
+        finally:
+            self.pending_deliveries -= 1
+
+    async def publish_local(self, event: Event) -> None:
+        event_type = type(event)
+        one_shot_tokens: list[object] = []
+        for subscription in tuple(self._subscriptions.values()):
+            if (
+                subscription.event_types is None
+                or event_type in subscription.event_types
+            ):
+                self.pending_deliveries += 1
+                self._task_group.start_soon(
+                    self._deliver_tracked_event, subscription, event
+                )
+                if subscription.one_shot:
+                    one_shot_tokens.append(subscription.token)
+
+        for token in one_shot_tokens:
+            self.unsubscribe(token)
+
+    async def wait_for_baseline(self) -> None:
+        for _ in range(100):
+            if (
+                self.wait_subscriptions == 0
+                and self.pending_deliveries == 0
+            ):
+                return
+
+            await sleep(0.01)
+
+        pytest.fail("event broker did not return to its subscription/task baseline")
 
 
 @task(
@@ -762,6 +837,182 @@ class TestAsyncScheduler:
 
             with pytest.raises(JobLookupError), fail_after(1):
                 await scheduler.get_job_result(job_id, wait=False)
+
+    async def test_get_job_result_subscription_completion_race(self) -> None:
+        class RaceEventBroker(TrackingEventBroker):
+            job_to_release: Job | None
+            result: JobResult | None
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.job_to_release = None
+                self.result = None
+
+            def subscribe(
+                self,
+                callback: Callable[..., Any],
+                event_types: Iterable[type[Event]] | None = None,
+                *,
+                is_async: bool = True,
+                one_shot: bool = False,
+            ):
+                subscription = super().subscribe(
+                    callback,
+                    event_types,
+                    is_async=is_async,
+                    one_shot=one_shot,
+                )
+                if event_types == {JobReleased, SchedulerStopped}:
+                    self._task_group.start_soon(
+                        scheduler.data_store.release_job,
+                        scheduler.identity,
+                        self.job_to_release,
+                        self.result,
+                    )
+
+                return subscription
+
+        broker = RaceEventBroker()
+        async with AsyncScheduler(event_broker=broker) as scheduler:
+            await scheduler.configure_task("task", func=dummy_async_job)
+            job = Job(
+                task_id="task",
+                executor="async",
+                result_expiration_time=timedelta(seconds=10),
+            )
+            broker.job_to_release = job
+            broker.result = JobResult.from_job(
+                job, JobOutcome.success, return_value="value"
+            )
+            await scheduler.data_store.add_job(job)
+
+            with fail_after(3):
+                result = await scheduler.get_job_result(job.id)
+
+            assert result is not None
+            assert result.return_value == "value"
+            await broker.wait_for_baseline()
+
+    async def test_get_job_result_timeout(self) -> None:
+        broker = TrackingEventBroker()
+        async with AsyncScheduler(event_broker=broker) as scheduler:
+            await scheduler.configure_task("task", func=dummy_async_job)
+            job = Job(task_id="task", executor="async")
+            await scheduler.data_store.add_job(job)
+
+            with pytest.raises(TimeoutError):
+                await scheduler.get_job_result(job.id, timeout=0)
+
+            await broker.wait_for_baseline()
+
+    async def test_get_job_result_completed_reads_store(self) -> None:
+        broker = TrackingEventBroker()
+        async with AsyncScheduler(event_broker=broker) as scheduler:
+            await scheduler.configure_task("task", func=dummy_async_job)
+            job = Job(
+                task_id="task",
+                executor="async",
+                result_expiration_time=timedelta(seconds=10),
+            )
+            result = JobResult.from_job(
+                job, JobOutcome.success, return_value="stored"
+            )
+            await scheduler.data_store.add_job(job)
+            await scheduler.data_store.release_job(
+                scheduler.identity, job, result
+            )
+
+            retrieved = await scheduler.get_job_result(job.id, timeout=0)
+
+            assert retrieved is not None
+            assert retrieved.return_value == "stored"
+            await broker.wait_for_baseline()
+
+    async def test_get_job_result_cancelled_waiter_does_not_consume_event(
+        self,
+    ) -> None:
+        async def long_running_job() -> None:
+            await sleep(0.2)
+
+        broker = TrackingEventBroker()
+        async with AsyncScheduler(event_broker=broker) as scheduler:
+            await scheduler.configure_task(
+                "long_running_job", func=long_running_job
+            )
+            job_id = await scheduler.add_job(
+                "long_running_job", result_expiration_time=10
+            )
+            await scheduler.start_in_background()
+
+            async def cancel_waiter() -> None:
+                with CancelScope() as scope:
+                    task_group.start_soon(cancel_scope_after_delay, scope)
+                    await scheduler.get_job_result(job_id)
+
+            async def cancel_scope_after_delay(scope: CancelScope) -> None:
+                await sleep(0.05)
+                scope.cancel()
+
+            async with create_task_group() as task_group:
+                task_group.start_soon(cancel_waiter)
+                result = await scheduler.get_job_result(job_id)
+
+            assert result is not None
+            assert result.outcome is JobOutcome.success
+
+            await broker.wait_for_baseline()
+
+    async def test_get_job_result_multiple_waiters_repeat_and_expiration(
+        self,
+    ) -> None:
+        broker = TrackingEventBroker()
+        async with AsyncScheduler(event_broker=broker) as scheduler:
+            await scheduler.configure_task("waiting_job", func=dummy_async_job)
+            job_id = await scheduler.add_job(
+                "waiting_job",
+                kwargs={"delay": 0.2},
+                result_expiration_time=timedelta(seconds=10),
+            )
+            expired_job_id = await scheduler.add_job(dummy_async_job)
+            await scheduler.start_in_background()
+            await sleep(0.05)
+
+            with pytest.raises(TimeoutError):
+                await scheduler.get_job_result(job_id, timeout=0)
+
+            async def second_waiter() -> None:
+                await scheduler.get_job_result(job_id, timeout=timedelta(seconds=3))
+
+            async with create_task_group() as task_group:
+                task_group.start_soon(scheduler.get_job_result, job_id)
+                task_group.start_soon(second_waiter)
+            await broker.wait_for_baseline()
+
+            with pytest.raises(JobLookupError):
+                await scheduler.get_job_result(job_id, wait=False)
+
+            with pytest.raises(JobLookupError):
+                await scheduler.get_job_result(expired_job_id)
+            await broker.wait_for_baseline()
+
+    async def test_get_job_result_stop_unblocks_expired_result_waiter(self) -> None:
+        async def delay_job():
+            await sleep(10)
+
+        broker = TrackingEventBroker()
+        async with AsyncScheduler(event_broker=broker) as scheduler:
+            await scheduler.configure_task("delay_job", func=delay_job)
+            job_id = await scheduler.add_job("delay_job")
+            await scheduler.start_in_background()
+            await sleep(0.05)
+
+            async with create_task_group() as task_group:
+                task_group.start_soon(scheduler.get_job_result, job_id)
+                await scheduler.stop()
+
+            with pytest.raises(JobLookupError):
+                await scheduler.get_job_result(job_id, wait=False)
+            await broker.wait_for_baseline()
 
     async def test_add_job_not_rewriting_task_config(
         self, raw_datastore: DataStore

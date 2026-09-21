@@ -358,10 +358,21 @@ class Scheduler:
         portal = self._ensure_services_ready()
         return portal.call(self._async_scheduler.get_jobs)
 
-    def get_job_result(self, job_id: UUID, *, wait: bool = True) -> JobResult | None:
+    def get_job_result(
+        self,
+        job_id: UUID,
+        *,
+        wait: bool = True,
+        timeout: float | timedelta | None = None,
+    ) -> JobResult | None:
         portal = self._ensure_services_ready()
         return portal.call(
-            partial(self._async_scheduler.get_job_result, job_id, wait=wait)
+            partial(
+                self._async_scheduler.get_job_result,
+                job_id,
+                wait=wait,
+                timeout=timeout,
+            )
         )
 
     def run_job(

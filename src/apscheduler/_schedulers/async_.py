@@ -20,6 +20,7 @@ from anyio import (
     TASK_STATUS_IGNORED,
     CancelScope,
     create_task_group,
+    fail_after,
     get_cancelled_exc_class,
     move_on_after,
     sleep,
@@ -720,7 +721,11 @@ class AsyncScheduler:
         return await self.data_store.get_jobs()
 
     async def get_job_result(
-        self, job_id: UUID, *, wait: bool = True
+        self,
+        job_id: UUID,
+        *,
+        wait: bool = True,
+        timeout: float | timedelta | None = None,
     ) -> JobResult | None:
         """
         Retrieve the result of a job.
@@ -728,6 +733,8 @@ class AsyncScheduler:
         :param job_id: the ID of the job
         :param wait: if ``True``, wait until the job has ended (one way or another),
             ``False`` to raise an exception if the result is not yet available
+        :param timeout: maximum time to wait for the result, or ``None`` to wait
+            indefinitely
         :returns: the job result, or ``None`` if the job finished but didn't record a
             result (``result_expiration_time`` was 0 or a similarly short time interval
             that did not allow for the result to be fetched before it was deleted)
@@ -738,18 +745,43 @@ class AsyncScheduler:
         """
         self._check_initialized()
         wait_event = anyio.Event()
+        stopping = self._state in (
+            RunState.starting,
+            RunState.started,
+            RunState.stopping,
+        )
 
-        def listener(event: JobReleased) -> None:
-            if event.job_id == job_id:
+        def listener(event: JobReleased | SchedulerStopped) -> None:
+            if (
+                isinstance(event, JobReleased) and event.job_id == job_id
+                or isinstance(event, SchedulerStopped)
+                and stopping
+            ):
                 wait_event.set()
 
-        with self.event_broker.subscribe(listener, {JobReleased}):
+        with self.event_broker.subscribe(
+            listener, {JobReleased, SchedulerStopped}
+        ):
             job_exists = bool(await self.data_store.get_jobs([job_id]))
             if result := await self.data_store.get_job_result(job_id):
                 return result
 
             if job_exists and wait:
-                await wait_event.wait()
+                try:
+                    if timeout is None:
+                        await wait_event.wait()
+                    else:
+                        if isinstance(timeout, timedelta):
+                            timeout = timeout.total_seconds()
+
+                        with fail_after(timeout):
+                            await wait_event.wait()
+                except (TimeoutError, get_cancelled_exc_class()):
+                    with CancelScope(shield=True):
+                        if result := await self.data_store.get_job_result(job_id):
+                            return result
+
+                    raise
             else:
                 raise JobLookupError(job_id)
 

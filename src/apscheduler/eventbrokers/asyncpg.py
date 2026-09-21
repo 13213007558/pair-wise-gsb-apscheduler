@@ -18,7 +18,6 @@ from asyncpg import Connection, InterfaceError
 from attr.validators import instance_of
 
 from .._events import Event
-from .._exceptions import SerializationError
 from .._utils import create_repr
 from .base import BaseExternalEventBroker
 
@@ -49,7 +48,7 @@ class AsyncpgEventBroker(BaseExternalEventBroker):
     channel: str = attrs.field(kw_only=True, default="apscheduler")
     max_idle_time: float = attrs.field(kw_only=True, default=10)
 
-    _send: MemoryObjectSendStream[str] = attrs.field(init=False)
+    _send: MemoryObjectSendStream[tuple[str, ...]] = attrs.field(init=False)
 
     @classmethod
     def from_async_sqla_engine(
@@ -101,12 +100,15 @@ class AsyncpgEventBroker(BaseExternalEventBroker):
 
     async def start(self, exit_stack: AsyncExitStack, logger: Logger) -> None:
         await super().start(exit_stack, logger)
-        self._send, receive = create_memory_object_stream[str](100)
+        self._send, receive = create_memory_object_stream[tuple[str, ...]](100)
         await exit_stack.enter_async_context(self._send)
         await self._task_group.start(self._listen_notifications, receive)
 
     async def _listen_notifications(
-        self, receive: MemoryObjectReceiveStream[str], *, task_status: TaskStatus[None]
+        self,
+        receive: MemoryObjectReceiveStream[tuple[str, ...]],
+        *,
+        task_status: TaskStatus[None],
     ) -> None:
         conn: Connection
 
@@ -124,6 +126,7 @@ class AsyncpgEventBroker(BaseExternalEventBroker):
 
         task_started_sent = False
         with receive:
+            notifications: tuple[str, ...] | None = None
             while True:
                 async with AsyncExitStack() as exit_stack:
                     conn = await exit_stack.enter_async_context(self._connect())
@@ -136,30 +139,32 @@ class AsyncpgEventBroker(BaseExternalEventBroker):
                             task_started_sent = True
 
                         while True:
-                            notification: str | None = None
-                            with move_on_after(self.max_idle_time):
-                                try:
-                                    notification = await receive.receive()
-                                except EndOfStream:
-                                    self._logger.info("Stream finished")
-                                    return
+                            if notifications is None:
+                                with move_on_after(self.max_idle_time):
+                                    try:
+                                        notifications = await receive.receive()
+                                    except EndOfStream:
+                                        self._logger.info("Stream finished")
+                                        return
 
-                            if notification:
-                                await conn.execute(
-                                    "SELECT pg_notify($1, $2)",
-                                    self.channel,
-                                    notification,
-                                )
-                            else:
+                            if notifications is None:
                                 await conn.execute("SELECT 1")
+                                continue
+
+                            try:
+                                for notification in notifications:
+                                    await conn.execute(
+                                        "SELECT pg_notify($1, $2)",
+                                        self.channel,
+                                        notification,
+                                    )
+                            except InterfaceError as exc:
+                                self._logger.error("Connection error: %s", exc)
+                                break
+
+                            notifications = None
                     except InterfaceError as exc:
                         self._logger.error("Connection error: %s", exc)
 
     async def publish(self, event: Event) -> None:
-        notification = self.generate_notification_str(event)
-        if len(notification) > 7999:
-            raise SerializationError(
-                "Serialized event object exceeds 7999 bytes in size"
-            )
-
-        await self._send.send(notification)
+        await self._send.send(self.generate_notifications_str(event))

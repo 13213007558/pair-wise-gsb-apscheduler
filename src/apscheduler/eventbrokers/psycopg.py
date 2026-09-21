@@ -17,7 +17,6 @@ from attr.validators import instance_of
 from psycopg import AsyncConnection, InterfaceError
 
 from .._events import Event
-from .._exceptions import SerializationError
 from .._utils import create_repr
 from .._validators import positive_number
 from .base import BaseExternalEventBroker
@@ -58,7 +57,7 @@ class PsycopgEventBroker(BaseExternalEventBroker):
         kw_only=True, default=10, validator=[instance_of((int, float)), positive_number]
     )
 
-    _send: MemoryObjectSendStream[str] = attrs.field(init=False)
+    _send: MemoryObjectSendStream[tuple[str, ...]] = attrs.field(init=False)
 
     @classmethod
     def from_async_sqla_engine(
@@ -112,7 +111,7 @@ class PsycopgEventBroker(BaseExternalEventBroker):
 
     async def start(self, exit_stack: AsyncExitStack, logger: Logger) -> None:
         await super().start(exit_stack, logger)
-        self._send, receive = create_memory_object_stream[str](100)
+        self._send, receive = create_memory_object_stream[tuple[str, ...]](100)
         try:
             await exit_stack.enter_async_context(self._send)
             await self._task_group.start(self._listen_notifications)
@@ -141,37 +140,44 @@ class PsycopgEventBroker(BaseExternalEventBroker):
                     self._logger.error("Connection error: %s", exc)
 
     async def _publish_notifications(
-        self, receive: MemoryObjectReceiveStream[str], *, task_status: TaskStatus[None]
+        self,
+        receive: MemoryObjectReceiveStream[tuple[str, ...]],
+        *,
+        task_status: TaskStatus[None],
     ) -> None:
         task_started_sent = False
         with receive:
+            notifications: tuple[str, ...] | None = None
             while True:
                 async with self._connect() as conn:
                     if not task_started_sent:
                         task_status.started()
                         task_started_sent = True
 
-                    self._logger.debug("Publish connection established")
-                    notification: str | None = None
                     while True:
-                        with move_on_after(self.max_idle_time):
-                            try:
-                                notification = await receive.receive()
-                            except EndOfStream:
-                                return
+                        self._logger.debug("Publish connection established")
+                        if notifications is None:
+                            with move_on_after(self.max_idle_time):
+                                try:
+                                    notifications = await receive.receive()
+                                except EndOfStream:
+                                    return
 
-                        if notification:
-                            await conn.execute(
-                                "SELECT pg_notify(%t, %t)", [self.channel, notification]
-                            )
-                        else:
+                        if notifications is None:
                             await conn.execute("SELECT 1")
+                            continue
+
+                        try:
+                            for notification in notifications:
+                                await conn.execute(
+                                    "SELECT pg_notify(%t, %t)",
+                                    [self.channel, notification],
+                                )
+                        except InterfaceError as exc:
+                            self._logger.error("Connection error: %s", exc)
+                            break
+
+                        notifications = None
 
     async def publish(self, event: Event) -> None:
-        notification = self.generate_notification_str(event)
-        if len(notification) > 7999:
-            raise SerializationError(
-                "Serialized event object exceeds 7999 bytes in size"
-            )
-
-        await self._send.send(notification)
+        await self._send.send(self.generate_notifications_str(event))

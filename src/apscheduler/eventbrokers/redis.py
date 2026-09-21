@@ -122,7 +122,8 @@ class RedisEventBroker(BaseExternalEventBroker):
                 raise
 
     async def publish(self, event: Event) -> None:
-        notification = self.generate_notification(event)
-        async for attempt in self._retry():
-            with attempt:
-                await self._client.publish(self.channel, notification)
+        notifications = self.generate_notifications(event)
+        for notification in notifications:
+            async for attempt in self._retry():
+                with attempt:
+                    await self._client.publish(self.channel, notification)

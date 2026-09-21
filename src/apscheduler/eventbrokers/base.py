@@ -3,12 +3,19 @@ from __future__ import annotations
 from base64 import b64decode, b64encode
 from collections.abc import Callable, Iterable
 from contextlib import AsyncExitStack
+from enum import Enum
 from inspect import iscoroutine
 from logging import Logger
+from threading import Lock
 from typing import Any
 
 import attrs
-from anyio import CapacityLimiter, create_task_group, to_thread
+from anyio import (
+    CapacityLimiter,
+    create_task_group,
+    get_cancelled_exc_class,
+    to_thread,
+)
 from anyio.abc import TaskGroup
 
 from .. import _events
@@ -19,6 +26,29 @@ from ..abc import EventBroker, Serializer, Subscription
 from ..serializers.json import JSONSerializer
 
 
+class OneShotState(Enum):
+    pending = "pending"
+    claimed = "claimed"
+    completed = "completed"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+@attrs.define(eq=False)
+class OneShotClaim:
+    state: OneShotState = OneShotState.pending
+
+    def claim(self) -> bool:
+        if self.state is not OneShotState.pending:
+            return False
+        self.state = OneShotState.claimed
+        return True
+
+    def finish(self, state: OneShotState) -> None:
+        if self.state is OneShotState.claimed:
+            self.state = state
+
+
 @attrs.define(eq=False, frozen=True)
 class LocalSubscription(Subscription):
     callback: Callable[[Event], Any]
@@ -27,6 +57,7 @@ class LocalSubscription(Subscription):
     is_async: bool
     token: object
     _source: BaseEventBroker
+    _claim: OneShotClaim | None = None
 
     def unsubscribe(self) -> None:
         self._source.unsubscribe(self.token)
@@ -40,6 +71,7 @@ class BaseEventBroker(EventBroker):
     )
     _task_group: TaskGroup = attrs.field(init=False)
     _thread_limiter: CapacityLimiter = attrs.field(init=False)
+    _subscription_lock: Lock = attrs.field(init=False, factory=Lock)
 
     async def start(self, exit_stack: AsyncExitStack, logger: Logger) -> None:
         self._logger = logger
@@ -56,46 +88,77 @@ class BaseEventBroker(EventBroker):
     ) -> Subscription:
         types = set(event_types) if event_types else None
         token = object()
+        claim = OneShotClaim() if one_shot else None
         subscription = LocalSubscription(
-            callback, types, one_shot, is_async, token, self
+            callback, types, one_shot, is_async, token, self, claim
         )
-        self._subscriptions[token] = subscription
+        with self._subscription_lock:
+            self._subscriptions[token] = subscription
+
         return subscription
 
     def unsubscribe(self, token: object) -> None:
-        self._subscriptions.pop(token, None)
+        with self._subscription_lock:
+            self._subscriptions.pop(token, None)
 
     async def publish_local(self, event: Event) -> None:
         event_type = type(event)
-        one_shot_tokens: list[object] = []
-        for subscription in self._subscriptions.values():
-            if (
-                subscription.event_types is None
-                or event_type in subscription.event_types
-            ):
-                self._task_group.start_soon(self._deliver_event, subscription, event)
-                if subscription.one_shot:
-                    one_shot_tokens.append(subscription.token)
+        matched_subscriptions: list[LocalSubscription] = []
+        with self._subscription_lock:
+            for subscription in tuple(self._subscriptions.values()):
+                if (
+                    subscription.event_types is None
+                    or event_type in subscription.event_types
+                ):
+                    if not subscription.one_shot or (
+                        subscription._claim is not None and subscription._claim.claim()
+                    ):
+                        matched_subscriptions.append(subscription)
+                        if subscription.one_shot:
+                            self._subscriptions.pop(subscription.token)
 
-        for token in one_shot_tokens:
-            self.unsubscribe(token)
+        for subscription in matched_subscriptions:
+            self._task_group.start_soon(self._deliver_event, subscription, event)
 
     async def _deliver_event(
         self, subscription: LocalSubscription, event: Event
     ) -> None:
         try:
-            if subscription.is_async:
-                retval = subscription.callback(event)
-                if iscoroutine(retval):
-                    await retval
-            else:
-                await to_thread.run_sync(
-                    subscription.callback, event, limiter=self._thread_limiter
+            try:
+                if subscription.is_async:
+                    retval = subscription.callback(event)
+                    if iscoroutine(retval):
+                        await retval
+                else:
+                    await to_thread.run_sync(
+                        subscription.callback, event, limiter=self._thread_limiter
+                    )
+            except BaseException as exc:
+                self._finish_one_shot(
+                    subscription,
+                    OneShotState.cancelled
+                    if isinstance(exc, get_cancelled_exc_class())
+                    else OneShotState.failed,
                 )
+                raise
+            else:
+                self._finish_one_shot(subscription, OneShotState.completed)
         except Exception:
             self._logger.exception(
                 "Error delivering %s event", event.__class__.__name__
             )
+
+    def _finish_one_shot(
+        self,
+        subscription: LocalSubscription,
+        state: OneShotState,
+    ) -> None:
+        claim = subscription._claim
+        if claim is None:
+            return
+
+        with self._subscription_lock:
+            claim.finish(state)
 
 
 @attrs.define(kw_only=True)

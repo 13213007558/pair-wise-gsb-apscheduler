@@ -16,6 +16,18 @@ class ConflictingIdError(KeyError):
         super().__init__(f"Job identifier ({job_id}) conflicts with an existing job")
 
 
+class JobConflictError(KeyError):
+    """Raised when a job update or removal is based on stale persisted state."""
+
+    def __init__(self, job_id, expected_version=None, actual_version=None):
+        self.expected_version = expected_version
+        self.actual_version = actual_version
+        super().__init__(
+            f"Job ({job_id}) was modified by another scheduler; expected version "
+            f"{expected_version}, found version {actual_version}"
+        )
+
+
 class TransientJobError(ValueError):
     """
     Raised when an attempt to add transient (with no func_ref) job to a persistent job store is
@@ -35,6 +47,9 @@ class BaseJobStore(metaclass=ABCMeta):
     _scheduler = None
     _alias = None
     _logger = logging.getLogger("apscheduler.jobstores")
+    supports_optimistic_jobs = False
+    conflict_policy = "error"
+    conflict_retries = 0
 
     def start(self, scheduler, alias):
         """
@@ -122,6 +137,7 @@ class BaseJobStore(metaclass=ABCMeta):
 
         :param Job job: the job to update
         :raises JobLookupError: if the job does not exist
+        :raises JobConflictError: if optimistic concurrency control detects stale state
         """
 
     @abstractmethod
@@ -131,6 +147,7 @@ class BaseJobStore(metaclass=ABCMeta):
 
         :param str|unicode job_id: identifier of the job
         :raises JobLookupError: if the job does not exist
+        :raises JobConflictError: if a conditional removal detects stale state
         """
 
     @abstractmethod

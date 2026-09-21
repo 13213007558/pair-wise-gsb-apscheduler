@@ -52,6 +52,9 @@ class Job:
         "coalesce",
         "max_instances",
         "next_run_time",
+        "_persistent_version",
+        "_lease_expires_at",
+        "_lease_token",
         "__weakref__",
     )
 
@@ -59,6 +62,9 @@ class Job:
         super().__init__()
         self._scheduler = scheduler
         self._jobstore_alias = None
+        self._persistent_version = None
+        self._lease_expires_at = None
+        self._lease_token = None
         self._modify(id=id or uuid4().hex, **kwargs)
 
     def modify(self, **changes):
@@ -296,6 +302,9 @@ class Job:
                 f"Job has version {state['version']}, but only version 1 can be handled"
             )
 
+        self._persistent_version = None
+        self._lease_expires_at = None
+        self._lease_token = None
         self.id = state["id"]
         self.func_ref = state["func"]
         self.func = ref_to_obj(self.func_ref)

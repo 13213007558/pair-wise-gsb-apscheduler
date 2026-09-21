@@ -1,8 +1,14 @@
+import pickle
+import time
 from datetime import datetime
 
 import pytest
 
-from apscheduler.jobstores.base import ConflictingIdError, JobLookupError
+from apscheduler.jobstores.base import (
+    ConflictingIdError,
+    JobConflictError,
+    JobLookupError,
+)
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.util import localize
 
@@ -421,6 +427,165 @@ def test_sqlalchemy_missing_engine():
     sqlalchemy = pytest.importorskip("apscheduler.jobstores.sqlalchemy")
     exc = pytest.raises(ValueError, sqlalchemy.SQLAlchemyJobStore)
     assert "Need either" in str(exc.value)
+
+
+def test_sqlalchemy_optimistic_interleaved_commit(tmp_path, create_add_job, timezone):
+    pytest.importorskip("apscheduler.jobstores.sqlalchemy")
+    from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+
+    db_path = tmp_path / "optimistic.sqlite"
+
+    def start_store():
+        store = SQLAlchemyJobStore(
+            url=f"sqlite:///{db_path}",
+            optimistic=True,
+            lease_duration=60,
+        )
+        store.start(None, "sqlalchemy")
+        return store
+
+    claimant = start_store()
+    administrator = start_store()
+    try:
+        job = create_add_job(
+            administrator, dummy_job, datetime(2000, 1, 1), id="shared"
+        )
+        due_time = localize(datetime(2001, 1, 1), timezone)
+        claimed_jobs = claimant.get_due_jobs(due_time)
+        assert len(claimed_jobs) == 1
+        claimed_job = claimed_jobs[0]
+        assert claimed_job._persistent_version == 2
+        assert claimed_job._lease_token is not None
+        assert claimant.get_due_jobs(due_time) == []
+
+        administrator_job = administrator.lookup_job(job.id)
+        assert administrator_job._lease_token is None
+        administrator_job.max_instances = 7
+        administrator.update_job(administrator_job)
+
+        stored_job = administrator.lookup_job(job.id)
+        assert stored_job.max_instances == 7
+        assert stored_job._persistent_version == 3
+        assert stored_job._lease_token is None
+
+        claimed_job.max_instances = 2
+        with pytest.raises(JobConflictError):
+            claimant.update_job(
+                claimed_job,
+                lease_token=claimed_job._lease_token,
+            )
+
+        administrator.remove_job(job.id)
+        claimed_job.next_run_time = localize(datetime(2002, 1, 1), timezone)
+        with pytest.raises(JobLookupError):
+            claimant.update_job(
+                claimed_job,
+                lease_token=claimed_job._lease_token,
+            )
+        with pytest.raises(JobLookupError):
+            claimant.remove_job(
+                job.id,
+                expected_version=claimed_job._persistent_version,
+                lease_token=claimed_job._lease_token,
+            )
+        assert administrator.lookup_job(job.id) is None
+    finally:
+        claimant.shutdown()
+        administrator.shutdown()
+
+
+def test_sqlalchemy_optimistic_lease_expiry(tmp_path, create_add_job, timezone):
+    pytest.importorskip("apscheduler.jobstores.sqlalchemy")
+    from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+
+    db_path = tmp_path / "lease.sqlite"
+    first = SQLAlchemyJobStore(url=f"sqlite:///{db_path}", optimistic=True)
+    second = SQLAlchemyJobStore(
+        url=f"sqlite:///{db_path}", optimistic=True, lease_duration=60
+    )
+    first.start(None, "first")
+    second.start(None, "second")
+    try:
+        create_add_job(first, dummy_job, datetime(2000, 1, 1), id="leased")
+        due_time = localize(datetime(2001, 1, 1), timezone)
+        assert len(first.get_due_jobs(due_time)) == 1
+        assert second.get_due_jobs(due_time) == []
+
+        from unittest.mock import patch
+
+        with patch.object(second, "_utc_timestamp", return_value=time.time() + 3600):
+            reclaimed_jobs = second.get_due_jobs(due_time)
+        assert [job.id for job in reclaimed_jobs] == ["leased"]
+        assert first.get_due_jobs(due_time) == []
+    finally:
+        first.shutdown()
+        second.shutdown()
+
+
+def test_sqlalchemy_optimistic_migrates_legacy_table(
+    tmp_path, create_add_job, timezone
+):
+    pytest.importorskip("apscheduler.jobstores.sqlalchemy")
+    from sqlalchemy import (
+        Column,
+        Float,
+        LargeBinary,
+        MetaData,
+        Table,
+        Unicode,
+        create_engine,
+    )
+
+    from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+    from apscheduler.util import datetime_to_utc_timestamp
+
+    db_path = tmp_path / "legacy.sqlite"
+    job = create_add_job(None, dummy_job, datetime(2000, 1, 1), id="legacy")
+    engine = create_engine(f"sqlite:///{db_path}")
+    metadata = MetaData()
+    legacy_jobs = Table(
+        "apscheduler_jobs",
+        metadata,
+        Column("id", Unicode(191), primary_key=True),
+        Column("next_run_time", Float(25), index=True),
+        Column("job_state", LargeBinary, nullable=False),
+    )
+    legacy_jobs.create(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            legacy_jobs.insert().values(
+                id=job.id,
+                next_run_time=datetime_to_utc_timestamp(job.next_run_time),
+                job_state=pickle.dumps(job.__getstate__()),
+            )
+        )
+
+    legacy_store = SQLAlchemyJobStore(url=f"sqlite:///{db_path}")
+    legacy_store.start(None, "sqlalchemy")
+    restored_job = legacy_store.lookup_job(job.id)
+    assert restored_job.id == job.id
+    assert restored_job.next_run_time == job.next_run_time
+    legacy_store.shutdown()
+
+    migrated_store = SQLAlchemyJobStore(url=f"sqlite:///{db_path}", optimistic=True)
+    migrated_store.start(None, "sqlalchemy")
+    migrated_job = migrated_store.lookup_job(job.id)
+    assert migrated_job.id == job.id
+    assert migrated_job.next_run_time == job.next_run_time
+    assert migrated_job._persistent_version == 1
+    due_jobs = migrated_store.get_due_jobs(localize(datetime(2001, 1, 1), timezone))
+    assert [due_job.id for due_job in due_jobs] == [job.id]
+    migrated_store.shutdown()
+
+    default_store = SQLAlchemyJobStore(url=f"sqlite:///{db_path}")
+    default_store.start(None, "sqlalchemy")
+    fallback_job = default_store.lookup_job(job.id)
+    assert fallback_job.id == job.id
+    assert fallback_job.next_run_time == job.next_run_time
+    assert default_store.get_all_jobs() == [job]
+    default_store.shutdown()
+
+    engine.dispose()
 
 
 def test_mongodb_client_ref():

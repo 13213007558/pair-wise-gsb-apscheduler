@@ -33,7 +33,12 @@ from apscheduler.events import (
 from apscheduler.executors.base import BaseExecutor, MaxInstancesReachedError
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.job import Job
-from apscheduler.jobstores.base import BaseJobStore, ConflictingIdError, JobLookupError
+from apscheduler.jobstores.base import (
+    BaseJobStore,
+    ConflictingIdError,
+    JobConflictError,
+    JobLookupError,
+)
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers import (
     SchedulerAlreadyRunningError,
@@ -576,10 +581,24 @@ class BaseScheduler(metaclass=ABCMeta):
 
         """
         with self._jobstores_lock:
-            job, jobstore = self._lookup_job(job_id, jobstore)
-            job._modify(**changes)
-            if jobstore:
-                self._lookup_jobstore(jobstore).update_job(job)
+            attempts = 0
+            while True:
+                job, jobstore = self._lookup_job(job_id, jobstore)
+                job._modify(**changes)
+                if not jobstore:
+                    break
+
+                store = self._lookup_jobstore(jobstore)
+                try:
+                    store.update_job(job)
+                except JobConflictError:
+                    policy = getattr(store, "conflict_policy", "error")
+                    max_attempts = getattr(store, "conflict_retries", 0) + 1
+                    if policy != "retry" or attempts >= max_attempts:
+                        raise
+                    attempts += 1
+                else:
+                    break
 
         self._dispatch_event(JobEvent(EVENT_JOB_MODIFIED, job_id, jobstore))
 
@@ -635,8 +654,13 @@ class BaseScheduler(metaclass=ABCMeta):
             next_run_time = job.trigger.get_next_fire_time(None, now)
             if next_run_time:
                 return self.modify_job(job_id, jobstore, next_run_time=next_run_time)
-            else:
+            if self.state == STATE_STOPPED or jobstore not in self._jobstores:
                 self.remove_job(job.id, jobstore)
+                return
+            self._remove_persistent_job(job.id, jobstore, job)
+
+        self._dispatch_event(JobEvent(EVENT_JOB_REMOVED, job_id, jobstore))
+        self._logger.info("Removed job %s", job_id)
 
     def get_jobs(self, jobstore=None, pending=None):
         """
@@ -1022,6 +1046,30 @@ class BaseScheduler(metaclass=ABCMeta):
 
         raise JobLookupError(job_id)
 
+    def _update_claimed_job(self, store, job):
+        if getattr(store, "supports_optimistic_jobs", False) is True:
+            store.update_job(job, lease_token=getattr(job, "_lease_token", None))
+        else:
+            store.update_job(job)
+
+    def _release_claimed_job(self, store, job):
+        if getattr(store, "supports_optimistic_jobs", False) is True:
+            try:
+                store.release_job_lease(job)
+            except (JobConflictError, JobLookupError):
+                pass
+
+    def _remove_persistent_job(self, job_id, jobstore_alias, job=None):
+        store = self._lookup_jobstore(jobstore_alias)
+        if getattr(store, "supports_optimistic_jobs", False) is True:
+            store.remove_job(
+                job_id,
+                expected_version=getattr(job, "_persistent_version", None),
+                lease_token=getattr(job, "_lease_token", None),
+            )
+        else:
+            store.remove_job(job_id)
+
     def _dispatch_event(self, event):
         """
         Dispatches the given event to interested listeners.
@@ -1154,6 +1202,9 @@ class BaseScheduler(metaclass=ABCMeta):
         events = []
 
         with self._jobstores_lock:
+            if self.state == STATE_STOPPED:
+                return None
+
             for jobstore_alias, jobstore in self._jobstores.items():
                 try:
                     due_jobs = jobstore.get_due_jobs(now)
@@ -1183,7 +1234,23 @@ class BaseScheduler(metaclass=ABCMeta):
                             job.executor,
                             job,
                         )
-                        self.remove_job(job.id, jobstore_alias)
+                        try:
+                            self._remove_persistent_job(job.id, jobstore_alias, job)
+                        except (JobConflictError, JobLookupError):
+                            self._logger.info(
+                                'Job "%s" was modified in job store "%s" while being '
+                                "processed; discarding the stale snapshot",
+                                job.id,
+                                jobstore_alias,
+                            )
+                        else:
+                            events.append(
+                                JobEvent(
+                                    EVENT_JOB_REMOVED,
+                                    job.id,
+                                    jobstore_alias,
+                                )
+                            )
                         continue
 
                     run_times = job._get_run_times(now)
@@ -1200,6 +1267,7 @@ class BaseScheduler(metaclass=ABCMeta):
                                 job,
                                 job.max_instances,
                             )
+                            self._release_claimed_job(jobstore, job)
                             event = JobSubmissionEvent(
                                 EVENT_JOB_MAX_INSTANCES,
                                 job.id,
@@ -1213,6 +1281,7 @@ class BaseScheduler(metaclass=ABCMeta):
                                 job,
                                 job.executor,
                             )
+                            self._release_claimed_job(jobstore, job)
                         else:
                             event = JobSubmissionEvent(
                                 EVENT_JOB_SUBMITTED, job.id, jobstore_alias, run_times
@@ -1224,11 +1293,26 @@ class BaseScheduler(metaclass=ABCMeta):
                         job_next_run = job.trigger.get_next_fire_time(
                             run_times[-1], now
                         )
-                        if job_next_run:
-                            job._modify(next_run_time=job_next_run)
-                            jobstore.update_job(job)
-                        else:
-                            self.remove_job(job.id, jobstore_alias)
+                        try:
+                            if job_next_run:
+                                job._modify(next_run_time=job_next_run)
+                                self._update_claimed_job(jobstore, job)
+                            else:
+                                self._remove_persistent_job(job.id, jobstore_alias, job)
+                                events.append(
+                                    JobEvent(
+                                        EVENT_JOB_REMOVED,
+                                        job.id,
+                                        jobstore_alias,
+                                    )
+                                )
+                        except (JobConflictError, JobLookupError):
+                            self._logger.info(
+                                'Job "%s" was modified in job store "%s" while being '
+                                "processed; discarding the stale snapshot",
+                                job.id,
+                                jobstore_alias,
+                            )
 
                 # Set a new next wakeup time if there isn't one yet or
                 # the jobstore has an even earlier one

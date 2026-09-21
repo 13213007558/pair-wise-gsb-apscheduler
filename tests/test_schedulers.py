@@ -34,7 +34,12 @@ from apscheduler.events import (
 from apscheduler.executors.base import BaseExecutor, MaxInstancesReachedError
 from apscheduler.executors.debug import DebugExecutor
 from apscheduler.job import Job
-from apscheduler.jobstores.base import BaseJobStore, ConflictingIdError, JobLookupError
+from apscheduler.jobstores.base import (
+    BaseJobStore,
+    ConflictingIdError,
+    JobConflictError,
+    JobLookupError,
+)
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers import (
     SchedulerAlreadyRunningError,
@@ -521,8 +526,8 @@ class TestBaseScheduler:
         )
         if not pending:
             jobstore = MagicMock()
-            scheduler._lookup_jobstore = (
-                lambda alias: jobstore if alias == "default" else None
+            scheduler._lookup_jobstore = lambda alias: (
+                jobstore if alias == "default" else None
             )
         scheduler.modify_job(
             "blah",
@@ -541,6 +546,32 @@ class TestBaseScheduler:
         event = scheduler._dispatch_event.call_args[0][0]
         assert event.code == EVENT_JOB_MODIFIED
         assert event.jobstore == (None if pending else "default")
+
+    def test_modify_job_retries_on_job_conflict(self, scheduler):
+        stale_job = MagicMock()
+        fresh_job = MagicMock()
+        jobstore = MagicMock()
+        jobstore.conflict_policy = "retry"
+        jobstore.conflict_retries = 1
+        jobstore.update_job.side_effect = [
+            JobConflictError("blah"),
+            None,
+        ]
+        scheduler._lookup_job = MagicMock(
+            side_effect=[(stale_job, "default"), (fresh_job, "default")]
+        )
+        scheduler._lookup_jobstore = lambda alias: jobstore
+        scheduler._dispatch_event = MagicMock()
+
+        scheduler.modify_job("blah", max_instances=2)
+
+        stale_job._modify.assert_called_once_with(max_instances=2)
+        fresh_job._modify.assert_called_once_with(max_instances=2)
+        assert jobstore.update_job.call_count == 2
+        event = scheduler._dispatch_event.call_args[0][0]
+        assert event.code == EVENT_JOB_MODIFIED
+        assert event.job_id == "blah"
+        assert event.jobstore == "default"
 
     def test_reschedule_job(self, scheduler):
         scheduler.modify_job = MagicMock()
@@ -702,40 +733,28 @@ class TestBaseScheduler:
         scheduler.print_jobs(jobstore, outfile)
 
         if jobstore and not start_scheduler:
-            assert (
-                outfile.getvalue()
-                == """\
+            assert outfile.getvalue() == """\
 Pending jobs:
     test job 2 (trigger: date[2099-08-08 00:00:00 CEST], pending)
 """
-            )
         elif jobstore and start_scheduler:
-            assert (
-                outfile.getvalue()
-                == """\
+            assert outfile.getvalue() == """\
 Jobstore other:
     test job 2 (trigger: date[2099-08-08 00:00:00 CEST], next run at: 2099-08-08 00:00:00 CEST)
 """
-            )
         elif not jobstore and not start_scheduler:
-            assert (
-                outfile.getvalue()
-                == """\
+            assert outfile.getvalue() == """\
 Pending jobs:
     test job 1 (trigger: date[2099-09-09 00:00:00 CEST], pending)
     test job 2 (trigger: date[2099-08-08 00:00:00 CEST], pending)
 """
-            )
         else:
-            assert (
-                outfile.getvalue()
-                == """\
+            assert outfile.getvalue() == """\
 Jobstore default:
     test job 1 (trigger: date[2099-09-09 00:00:00 CEST], next run at: 2099-09-09 00:00:00 CEST)
 Jobstore other:
     test job 2 (trigger: date[2099-08-08 00:00:00 CEST], next run at: 2099-08-08 00:00:00 CEST)
 """
-            )
 
     def test_export_import_jobs(self, scheduler):
         scheduler.start(paused=True)

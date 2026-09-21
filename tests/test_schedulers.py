@@ -4,7 +4,7 @@ import os
 import sys
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 from datetime import datetime, timedelta, timezone
@@ -14,6 +14,7 @@ from queue import Queue
 from types import ModuleType
 from typing import Any, cast
 from unittest.mock import patch
+from uuid import UUID
 
 import anyio
 import attrs
@@ -91,6 +92,56 @@ def dummy_sync_job(delay: float = 0, fail: bool = False) -> str:
         raise RuntimeError("failing as requested")
     else:
         return "returnvalue"
+
+
+class FixedClock:
+    """An injectable clock whose current time can be moved at will."""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+class ScriptedRandom:
+    """
+    An injectable random source that always returns a fixed fraction of the requested
+    upper bound, making jitter values fully reproducible.
+    """
+
+    def __init__(self, fraction: float = 0.5) -> None:
+        self.fraction = fraction
+        self.calls: list[tuple[float, float]] = []
+
+    def uniform(self, a: float, b: float) -> float:
+        self.calls.append((a, b))
+        return b * self.fraction
+
+
+async def process_due_schedules(
+    scheduler: AsyncScheduler, now: datetime | None = None
+) -> None:
+    """Run a single deterministic schedule processing cycle against the store."""
+    now = now or scheduler.time_source()
+    schedules = [
+        schedule
+        for schedule in await scheduler.data_store.get_schedules()
+        if not schedule.paused
+        and schedule.next_fire_time is not None
+        and schedule.next_fire_time <= now
+    ]
+    results = await scheduler._process_acquired_schedules(schedules)
+    await scheduler.data_store.release_schedules(scheduler.identity, results)
+
+
+def job_signature(job: Job) -> tuple[datetime, timedelta, datetime, datetime | None]:
+    return (
+        job.original_scheduled_time,
+        job.jitter,
+        job.scheduled_fire_time,
+        job.start_deadline,
+    )
 
 
 @task(
@@ -676,6 +727,262 @@ class TestAsyncScheduler:
                 assert jobs[0].scheduled_fire_time == now + timedelta(seconds=jitter)
                 assert jobs[0].original_scheduled_time == now
 
+    async def test_jitter_misfire_deadline_uses_original_fire_time(
+        self, raw_datastore: DataStore
+    ) -> None:
+        """
+        The misfire start deadline must be calculated from the original, un-jittered
+        fire time, so a large positive jitter can never push the misfire boundary to
+        a later time.
+
+        """
+        origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        now = origin + timedelta(seconds=65)
+        clock = FixedClock(now)
+        rng = ScriptedRandom()
+        trigger = IntervalTrigger(seconds=60, start_time=origin)
+        async with AsyncScheduler(
+            data_store=raw_datastore, time_source=clock, random=rng
+        ) as scheduler:
+            await scheduler.add_schedule(
+                dummy_async_job,
+                trigger,
+                id="foo",
+                coalesce=CoalescePolicy.all,
+                max_jitter=60,
+                misfire_grace_time=10,
+            )
+            await process_due_schedules(scheduler)
+
+            jobs = sorted(
+                await scheduler.get_jobs(),
+                key=lambda job: job.original_scheduled_time,
+            )
+            assert len(jobs) == 2
+
+            # The job at the origin is 65 seconds late. Its jitter of almost 30 seconds
+            # must not rescue it past the 10 second grace period.
+            assert jobs[0].original_scheduled_time == origin
+            assert jobs[0].jitter == timedelta(seconds=29.9999995)
+            assert jobs[0].scheduled_fire_time == origin + jobs[0].jitter
+            assert jobs[0].start_deadline == origin + timedelta(seconds=10)
+            assert now > jobs[0].start_deadline
+
+            # The job 60 seconds after the origin is only 5 seconds late and still
+            # within the grace period despite the deadline being based on the
+            # original fire time.
+            assert jobs[1].original_scheduled_time == origin + timedelta(seconds=60)
+            assert jobs[1].start_deadline == origin + timedelta(seconds=70)
+            assert now < jobs[1].start_deadline
+
+    async def test_resume_sequence_matches_uninterrupted(self) -> None:
+        """
+        After a long pause, the jobs created for the missed fire times (their original
+        scheduled times, jitter, actual scheduled fire times, start deadlines) and the
+        advanced schedule state must match the jobs that would have been created if
+        the scheduler had kept running the whole time.
+
+        """
+        origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        resume_time = origin + timedelta(seconds=180)
+        grace = timedelta(seconds=45)
+        common_kwargs = {
+            "coalesce": CoalescePolicy.all,
+            "max_jitter": 60,
+            "misfire_grace_time": grace,
+        }
+
+        def make_trigger() -> IntervalTrigger:
+            return IntervalTrigger(seconds=60, start_time=origin)
+
+        # Simulate an uninterrupted scheduler processing the schedule once per minute.
+        clock = FixedClock(origin)
+        async with AsyncScheduler(
+            data_store=MemoryDataStore(),
+            time_source=clock,
+            random=ScriptedRandom(),
+        ) as scheduler:
+            await scheduler.add_schedule(
+                dummy_async_job, make_trigger(), id="foo", **common_kwargs
+            )
+            uninterrupted_jobs: dict[UUID, Job] = {}
+            for elapsed in (60, 120, 180):
+                clock.now = origin + timedelta(seconds=elapsed)
+                await process_due_schedules(scheduler)
+                uninterrupted_jobs.update(
+                    {job.id: job for job in await scheduler.get_jobs()}
+                )
+
+            uninterrupted_schedule = await scheduler.get_schedule("foo")
+
+        # Simulate the schedule being paused for three minutes and then resumed, with
+        # all four fire times processed in a single batch at the resume time.
+        async with AsyncScheduler(
+            data_store=MemoryDataStore(),
+            time_source=FixedClock(resume_time),
+            random=ScriptedRandom(),
+        ) as scheduler:
+            await scheduler.add_schedule(
+                dummy_async_job,
+                make_trigger(),
+                id="foo",
+                paused=True,
+                **common_kwargs,
+            )
+            await scheduler.unpause_schedule("foo")
+            await process_due_schedules(scheduler)
+            resumed_jobs = {job.id: job for job in await scheduler.get_jobs()}
+            resumed_schedule = await scheduler.get_schedule("foo")
+
+        uninterrupted = sorted(
+            uninterrupted_jobs.values(), key=lambda job: job.original_scheduled_time
+        )
+        resumed = sorted(
+            resumed_jobs.values(), key=lambda job: job.original_scheduled_time
+        )
+        expected_original_times = [
+            origin + timedelta(seconds=offset) for offset in (0, 60, 120, 180)
+        ]
+        assert [job.original_scheduled_time for job in uninterrupted] == (
+            expected_original_times
+        )
+        assert [job.original_scheduled_time for job in resumed] == (
+            expected_original_times
+        )
+        assert [job_signature(job) for job in uninterrupted] == [
+            job_signature(job) for job in resumed
+        ]
+        assert (
+            uninterrupted_schedule.next_fire_time,
+            uninterrupted_schedule.last_fire_time,
+        ) == (resumed_schedule.next_fire_time, resumed_schedule.last_fire_time)
+
+    async def test_resume_latest_coalesce_advances_schedule_consistently(self) -> None:
+        """
+        With the ``latest`` coalesce policy, a backlog of missed fire times is
+        coalesced into a single job designated for the latest fire time, but that
+        job's misfire deadline must still be based on that original fire time and the
+        schedule must be advanced the same way as in uninterrupted processing.
+
+        """
+        origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        resume_time = origin + timedelta(seconds=180)
+        kwargs = {
+            "coalesce": CoalescePolicy.latest,
+            "max_jitter": 60,
+            "misfire_grace_time": timedelta(seconds=45),
+        }
+
+        def make_trigger() -> IntervalTrigger:
+            return IntervalTrigger(seconds=60, start_time=origin)
+
+        # The schedule is processed every minute without interruption.
+        clock = FixedClock(origin)
+        async with AsyncScheduler(
+            data_store=MemoryDataStore(),
+            time_source=clock,
+            random=ScriptedRandom(),
+        ) as scheduler:
+            await scheduler.add_schedule(
+                dummy_async_job, make_trigger(), id="foo", **kwargs
+            )
+            for elapsed in (60, 120, 180):
+                clock.now = origin + timedelta(seconds=elapsed)
+                await process_due_schedules(scheduler)
+
+            uninterrupted_schedule = await scheduler.get_schedule("foo")
+
+        # The schedule is paused and only resumed at t+180, coalescing the backlog.
+        async with AsyncScheduler(
+            data_store=MemoryDataStore(),
+            time_source=FixedClock(resume_time),
+            random=ScriptedRandom(),
+        ) as scheduler:
+            await scheduler.add_schedule(
+                dummy_async_job,
+                make_trigger(),
+                id="foo",
+                paused=True,
+                **kwargs,
+            )
+            await scheduler.unpause_schedule("foo")
+            await process_due_schedules(scheduler)
+            resumed_jobs = await scheduler.get_jobs()
+            resumed_schedule = await scheduler.get_schedule("foo")
+
+        # The whole backlog was coalesced into a single job designated for the latest
+        # missed fire time, and its deadline is based on that original fire time
+        # (180s + 45s grace), never on the jittered scheduled fire time.
+        assert len(resumed_jobs) == 1
+        coalesced_job = resumed_jobs[0]
+        assert coalesced_job.original_scheduled_time == resume_time
+        assert coalesced_job.jitter > timedelta()
+        assert coalesced_job.scheduled_fire_time == (resume_time + coalesced_job.jitter)
+        assert coalesced_job.start_deadline == resume_time + timedelta(seconds=45)
+        assert (
+            uninterrupted_schedule.next_fire_time,
+            uninterrupted_schedule.last_fire_time,
+        ) == (resumed_schedule.next_fire_time, resumed_schedule.last_fire_time)
+
+    async def test_multi_miss_misfire_outcomes_and_coalesce_count(self) -> None:
+        """
+        End to end check that, when several fire times are missed at once, every job's
+        misfire decision is based on its original fire time, the result events carry
+        the right outcomes and the "all" coalesce policy queues one job per fire time.
+
+        """
+        # 5 fire times (245s ago .. 5s ago) are already due when processing starts.
+        start_time = datetime.now(timezone.utc) - timedelta(seconds=245)
+        trigger = IntervalTrigger(seconds=60, start_time=start_time)
+        scheduler_send, scheduler_receive = create_memory_object_stream[Event](32)
+        worker_send, worker_receive = create_memory_object_stream[Event](32)
+        with scheduler_send, scheduler_receive, worker_send, worker_receive:
+            async with AsyncExitStack() as exit_stack:
+                scheduler = await exit_stack.enter_async_context(AsyncScheduler())
+                await scheduler.add_schedule(
+                    dummy_async_job,
+                    trigger,
+                    id="foo",
+                    coalesce=CoalescePolicy.all,
+                    max_jitter=60,
+                    misfire_grace_time=70,
+                )
+                exit_stack.enter_context(
+                    scheduler.subscribe(scheduler_send.send, {JobAdded})
+                )
+                exit_stack.enter_context(
+                    scheduler.subscribe(worker_send.send, {JobReleased})
+                )
+                await scheduler.start_in_background()
+
+                with fail_after(10):
+                    # The coalesce policy "all" produces one job per missed fire time.
+                    added_job_ids = []
+                    for _ in range(5):
+                        event = await scheduler_receive.receive()
+                        assert isinstance(event, JobAdded)
+                        added_job_ids.append(event.job_id)
+
+                    released_events = []
+                    for _ in range(5):
+                        event = await worker_receive.receive()
+                        assert isinstance(event, JobReleased)
+                        released_events.append(event)
+
+        outcomes = Counter(event.outcome for event in released_events)
+        assert outcomes[JobOutcome.missed_start_deadline] == 3
+        assert outcomes[JobOutcome.success] == 2
+
+        # The misfired jobs were never started and carry their jittered scheduled
+        # start times in the release events.
+        misfired_events = [
+            event
+            for event in released_events
+            if event.outcome is JobOutcome.missed_start_deadline
+        ]
+        assert all(event.started_at is None for event in misfired_events)
+        assert all(event.schedule_id == "foo" for event in released_events)
+
     async def test_add_job_get_result_success(self, raw_datastore: DataStore) -> None:
         async with AsyncScheduler(data_store=raw_datastore) as scheduler:
             job_id = await scheduler.add_job(
@@ -800,9 +1107,7 @@ class TestAsyncScheduler:
             assert info.original_scheduled_time == now
             assert info.scheduled_fire_time == now + timedelta(seconds=2.16)
             assert info.jitter == timedelta(seconds=2.16)
-            assert info.start_deadline == now + timedelta(seconds=2.16) + timedelta(
-                seconds=10
-            )
+            assert info.start_deadline == now + timedelta(seconds=10)
 
         fake_uniform = mocker.patch("random.uniform")
         fake_uniform.configure_mock(return_value=2.16)

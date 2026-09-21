@@ -21,7 +21,7 @@ from .._events import Event, T_Event
 from .._structures import Job, JobResult, MetadataType, Schedule, Task, TaskDefaults
 from .._utils import UnsetValue, create_repr, unset
 from ..abc import DataStore, EventBroker, JobExecutor, Subscription, Trigger
-from .async_ import AsyncScheduler, TaskType
+from .async_ import AsyncScheduler, TaskType, _utc_now
 
 if sys.version_info >= (3, 11):
     from typing import Self
@@ -60,6 +60,8 @@ class Scheduler:
         job_executors: MutableMapping[str, JobExecutor] | None = None,
         task_defaults: TaskDefaults | None = None,
         logger: Logger | None = None,
+        time_source: Callable[[], datetime] = _utc_now,
+        random: Any = None,
     ):
         kwargs: dict[str, Any] = {}
         if data_store is not None:
@@ -85,6 +87,8 @@ class Scheduler:
             job_executors=job_executors or {},
             cleanup_interval=cleanup_interval,
             lease_duration=lease_duration,
+            time_source=time_source,
+            random=random,
             **kwargs,
         )
         self.__attrs_init__(async_scheduler=async_scheduler)
@@ -128,6 +132,14 @@ class Scheduler:
     @property
     def task_defaults(self) -> TaskDefaults:
         return self._async_scheduler.task_defaults
+
+    @property
+    def time_source(self) -> Callable[[], datetime]:
+        return self._async_scheduler.time_source
+
+    @property
+    def random(self) -> Any:
+        return self._async_scheduler.random
 
     @property
     def state(self) -> RunState:

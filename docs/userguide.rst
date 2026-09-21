@@ -283,6 +283,11 @@ acquires jobs, the data store discards any jobs that have passed their start dea
 (scheduled time + ``misfire_grace_time``). Such jobs are released with the outcome of
 :attr:`~JobOutcome.missed_start_deadline`.
 
+The deadline is always calculated from the original fire time produced by the trigger,
+before any schedule ``max_jitter`` is applied. The randomized jitter therefore only
+shifts the job's recorded scheduled start time; it can never extend (or shrink) the
+window in which a late job is still allowed to start.
+
 Adding custom metadata
 ----------------------
 

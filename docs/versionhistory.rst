@@ -6,6 +6,10 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **UNRELEASED**
 
+- Fixed schedule jitter shifting the misfire (``misfire_grace_time``) start deadline of
+  late jobs; the deadline is now based on the original, un-jittered fire time, so a
+  long pause followed by processing multiple missed fire times produces the same
+  misfire decisions, coalesced jobs and advanced schedule state as an uninterrupted run
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+

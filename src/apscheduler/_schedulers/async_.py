@@ -76,6 +76,11 @@ else:
 _microsecond_delta = timedelta(microseconds=1)
 _zero_timedelta = timedelta()
 
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 TaskType: TypeAlias = "Task | str | Callable[..., Any]"
 T = TypeVar("T")
 
@@ -107,6 +112,12 @@ class AsyncScheduler:
         the scheduler can keep a lock on a schedule or task
     :param logger: the logger instance used to log events from the scheduler, data store
         and event broker
+    :param time_source: a callable that returns the current date and time as a timezone
+        aware :class:`~datetime.datetime` (used as an injectable clock, mainly
+        intended for testing)
+    :param random: a random number generator (any object providing
+        ``uniform(a, b)``, like :class:`random.Random`) used to calculate schedule
+        jitter – mainly intended for testing to get reproducible jitter values
     """
 
     data_store: DataStore = attrs.field(
@@ -134,6 +145,10 @@ class AsyncScheduler:
     )
     lease_duration: timedelta = attrs.field(converter=as_timedelta, default=30)
     logger: Logger = attrs.field(kw_only=True, default=getLogger(__name__))
+    time_source: Callable[[], datetime] = attrs.field(
+        kw_only=True, default=_utc_now, repr=False
+    )
+    random: Any = attrs.field(kw_only=True, default=None, repr=False)
 
     _state: RunState = attrs.field(init=False, default=RunState.stopped)
     _services_task_group: TaskGroup | None = attrs.field(init=False, default=None)
@@ -168,6 +183,9 @@ class AsyncScheduler:
 
         if self.task_defaults.misfire_grace_time is unset:
             self.task_defaults.misfire_grace_time = None
+
+        if self.random is None:
+            self.random = random
 
     async def __aenter__(self) -> Self:
         async with AsyncExitStack() as exit_stack:
@@ -625,7 +643,7 @@ class AsyncScheduler:
         schedule = await self.get_schedule(id)
 
         if resume_from == "now":
-            resume_from = datetime.now(tz=timezone.utc)
+            resume_from = self.time_source()
 
         if resume_from is None:
             next_fire_time = schedule.next_fire_time
@@ -969,97 +987,7 @@ class AsyncScheduler:
                     )
                     exit_stack.callback(tg.cancel_scope.cancel)
 
-                    now = datetime.now(timezone.utc)
-                    results: list[ScheduleResult] = []
-                    for schedule in schedules:
-                        # Calculate a next fire time for the schedule, if possible
-                        fire_times = [schedule.next_fire_time]
-                        calculate_next = schedule.trigger.next
-                        while True:
-                            try:
-                                fire_time = calculate_next()
-                            except Exception:
-                                self.logger.exception(
-                                    "Error computing next fire time for schedule %r of "
-                                    "task %r – removing schedule",
-                                    schedule.id,
-                                    schedule.task_id,
-                                )
-                                break
-
-                            # Stop if the calculated fire time is in the future
-                            if fire_time is None or fire_time > now:
-                                next_fire_time = fire_time
-                                break
-
-                            # Only keep all the fire times if coalesce policy = "all"
-                            if schedule.coalesce is CoalescePolicy.all:
-                                fire_times.append(fire_time)
-                            elif schedule.coalesce is CoalescePolicy.latest:
-                                fire_times[0] = fire_time
-
-                        # Add one or more jobs to the job queue
-                        max_jitter = (
-                            schedule.max_jitter.total_seconds()
-                            if schedule.max_jitter
-                            else 0
-                        )
-                        for i, fire_time in enumerate(fire_times):
-                            # Calculate a jitter if max_jitter > 0
-                            jitter = _zero_timedelta
-                            if max_jitter:
-                                if i + 1 < len(fire_times):
-                                    following_fire_time = fire_times[i + 1]
-                                else:
-                                    following_fire_time = next_fire_time
-
-                                if following_fire_time is not None:
-                                    # Jitter must never be so high that it would cause a
-                                    # fire time to equal or exceed the next fire time
-                                    max_jitter = min(
-                                        [
-                                            max_jitter,
-                                            (
-                                                following_fire_time
-                                                - fire_time
-                                                - _microsecond_delta
-                                            ).total_seconds(),
-                                        ]
-                                    )
-
-                                jitter = timedelta(
-                                    seconds=random.uniform(0, max_jitter)
-                                )
-                                fire_time += jitter
-
-                            if schedule.misfire_grace_time is None:
-                                start_deadline: datetime | None = None
-                            else:
-                                start_deadline = fire_time + schedule.misfire_grace_time
-
-                            job = Job(
-                                task_id=schedule.task_id,
-                                args=schedule.args,
-                                kwargs=schedule.kwargs,
-                                schedule_id=schedule.id,
-                                scheduled_fire_time=fire_time,
-                                jitter=jitter,
-                                start_deadline=start_deadline,
-                                executor=schedule.job_executor,
-                                result_expiration_time=schedule.job_result_expiration_time,
-                                metadata=schedule.metadata.copy(),
-                            )
-                            await self.data_store.add_job(job)
-
-                        results.append(
-                            ScheduleResult(
-                                schedule_id=schedule.id,
-                                task_id=schedule.task_id,
-                                trigger=schedule.trigger,
-                                last_fire_time=fire_times[-1],
-                                next_fire_time=next_fire_time,
-                            )
-                        )
+                    results = await self._process_acquired_schedules(schedules)
 
                 # Update the schedules (and release the scheduler's claim on them)
                 await self.data_store.release_schedules(self.identity, results)
@@ -1072,7 +1000,7 @@ class AsyncScheduler:
                     wakeup_deadline = await self.data_store.get_next_schedule_run_time()
                     if wakeup_deadline:
                         wait_time = (
-                            wakeup_deadline - datetime.now(timezone.utc)
+                            wakeup_deadline - self.time_source()
                         ).total_seconds()
                         self.logger.debug(
                             "Sleeping %.3f seconds until the next fire time (%s)",
@@ -1087,6 +1015,111 @@ class AsyncScheduler:
                         wakeup_event = anyio.Event()
                 else:
                     self.logger.debug("Processing more schedules on the next iteration")
+
+    async def _process_acquired_schedules(
+        self, schedules: Sequence[Schedule]
+    ) -> list[ScheduleResult]:
+        """
+        Create jobs for all the fire times of the acquired schedules that are due,
+        and calculate the schedule results needed to advance them.
+
+        """
+        now = self.time_source()
+        results: list[ScheduleResult] = []
+        for schedule in schedules:
+            # Calculate a next fire time for the schedule, if possible
+            assert schedule.next_fire_time is not None
+            fire_times: list[datetime] = [schedule.next_fire_time]
+            next_fire_time: datetime | None = None
+            calculate_next = schedule.trigger.next
+            while True:
+                try:
+                    fire_time = calculate_next()
+                except Exception:
+                    self.logger.exception(
+                        "Error computing next fire time for schedule %r of task %r – "
+                        "removing schedule",
+                        schedule.id,
+                        schedule.task_id,
+                    )
+                    break
+
+                # Stop if the calculated fire time is in the future
+                if fire_time is None or fire_time > now:
+                    next_fire_time = fire_time
+                    break
+
+                # Only keep all the fire times if coalesce policy = "all"
+                if schedule.coalesce is CoalescePolicy.all:
+                    fire_times.append(fire_time)
+                elif schedule.coalesce is CoalescePolicy.latest:
+                    fire_times[0] = fire_time
+
+            # Add one or more jobs to the job queue
+            schedule_max_jitter = (
+                schedule.max_jitter.total_seconds() if schedule.max_jitter else 0
+            )
+            for i, original_fire_time in enumerate(fire_times):
+                # Calculate a jitter if jitter is enabled for the schedule
+                jitter = _zero_timedelta
+                if schedule_max_jitter:
+                    following_fire_time: datetime | None
+                    if i + 1 < len(fire_times):
+                        following_fire_time = fire_times[i + 1]
+                    else:
+                        following_fire_time = next_fire_time
+
+                    max_jitter = schedule_max_jitter
+                    if following_fire_time is not None:
+                        # Jitter must never be so high that it would cause a fire time
+                        # to equal or exceed the next (un-jittered) fire time
+                        max_jitter = min(
+                            schedule_max_jitter,
+                            (
+                                following_fire_time
+                                - original_fire_time
+                                - _microsecond_delta
+                            ).total_seconds(),
+                        )
+
+                    jitter = timedelta(seconds=self.random.uniform(0, max_jitter))
+
+                scheduled_fire_time = original_fire_time + jitter
+
+                # The misfire check must be based on the original scheduled time,
+                # without the jitter, so that the jitter (which is applied only after
+                # the original fire time has arrived) cannot extend the deadline by
+                # which a late job is considered to have misfired.
+                if schedule.misfire_grace_time is None:
+                    start_deadline: datetime | None = None
+                else:
+                    start_deadline = original_fire_time + schedule.misfire_grace_time
+
+                job = Job(
+                    task_id=schedule.task_id,
+                    args=schedule.args,
+                    kwargs=schedule.kwargs,
+                    schedule_id=schedule.id,
+                    scheduled_fire_time=scheduled_fire_time,
+                    jitter=jitter,
+                    start_deadline=start_deadline,
+                    executor=schedule.job_executor,
+                    result_expiration_time=schedule.job_result_expiration_time,
+                    metadata=schedule.metadata.copy(),
+                )
+                await self.data_store.add_job(job)
+
+            results.append(
+                ScheduleResult(
+                    schedule_id=schedule.id,
+                    task_id=schedule.task_id,
+                    trigger=schedule.trigger,
+                    last_fire_time=fire_times[-1],
+                    next_fire_time=next_fire_time,
+                )
+            )
+
+        return results
 
     def _get_task_callable(self, task: Task) -> Callable:
         try:
@@ -1178,7 +1211,7 @@ class AsyncScheduler:
     async def _run_job(self, job: Job, func: Callable[..., Any], executor: str) -> None:
         try:
             # Check if the job started before the deadline
-            start_time = datetime.now(timezone.utc)
+            start_time = self.time_source()
             if job.start_deadline is not None and start_time > job.start_deadline:
                 result = JobResult.from_job(
                     job, JobOutcome.missed_start_deadline, finished_at=start_time

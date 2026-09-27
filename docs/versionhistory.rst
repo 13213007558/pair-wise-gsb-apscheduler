@@ -6,6 +6,19 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **UNRELEASED**
 
+- Fixed a race condition where a job whose lease had expired and been acquired by
+  another scheduler could still be deleted by the original holder's late
+  ``release_job()`` call (or have its lease extended), causing ``KeyError`` on the
+  new holder's completion, stale job results and incorrect ``running_jobs``
+  accounting. Job claims are now identified by a per-acquisition token, so late
+  releases and lease extensions (including from a reused scheduler identity after a
+  restart) are ignored, and duplicate completion reports no longer decrement
+  counters or publish duplicate ``JobReleased`` events. The SQLAlchemy data store
+  schema was bumped to version 2 (automatically migrated) to store the claim
+  tokens
+- **BREAKING** ``DataStore.extend_acquired_job_leases()`` now receives the
+  :class:`~Job` objects instead of a set of job IDs, so that the stores can verify
+  the claims being extended
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+

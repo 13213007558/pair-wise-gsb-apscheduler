@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right, insort_right
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from datetime import MAXYEAR, datetime, timedelta, timezone
 from functools import partial
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import attrs
 
@@ -216,10 +216,12 @@ class MemoryDataStore(BaseDataStore):
             ids = frozenset(ids)
 
         if ids is None:
-            return list(self._jobs_by_id.values())
+            return [attrs.evolve(job) for job in self._jobs_by_id.values()]
 
         return [
-            job for job in self._jobs_by_id.values() if ids is None or job.id in ids
+            attrs.evolve(job)
+            for job in self._jobs_by_id.values()
+            if ids is None or job.id in ids
         ]
 
     async def acquire_jobs(
@@ -228,25 +230,30 @@ class MemoryDataStore(BaseDataStore):
         now = datetime.now(timezone.utc)
         acquired_until = now + lease_duration
         jobs: list[Job] = []
-        job_results: dict[Job, JobResult] = {}
+        discarded: list[tuple[Job, JobResult]] = []
         for job in self._jobs_by_id.values():
             task = self._tasks[job.task_id]
 
-            # Skip already acquired jobs (unless the acquisition lock has expired)
-            if job.acquired_until is not None:
-                if job.acquired_until >= now:
-                    continue
-                else:
-                    task.running_jobs -= 1
+            # Skip jobs still held by a live claim
+            if job.acquired_until is not None and job.acquired_until >= now:
+                continue
+
+            # The previous claim on this job has expired. Revert the slot held by
+            # the expired claim so that the accounting does not depend on whether
+            # this job is acquired again or discarded below.
+            expired_claim = job.acquired_until is not None
+            if expired_claim:
+                task.running_jobs -= 1
 
             # Discard the job if its start deadline has passed
             if job.start_deadline and job.start_deadline < now:
-                job_results[job] = JobResult(
+                result = JobResult(
                     job_id=job.id,
                     outcome=JobOutcome.missed_start_deadline,
                     finished_at=now,
                     expires_at=now + job.result_expiration_time,
                 )
+                discarded.append((job, result))
                 continue
 
             # Skip the job if no more slots are available
@@ -261,12 +268,20 @@ class MemoryDataStore(BaseDataStore):
                     job.task_id,
                     task.running_jobs,
                 )
+                if expired_claim:
+                    # Release the expired claim so no one would mistake the job for
+                    # still being held while it waits for a slot to free up.
+                    job.acquired_by = None
+                    job.acquired_until = None
+                    job.acquired_token = None
                 continue
 
             # Mark the job as acquired by this worker
-            jobs.append(job)
+            token = uuid4()
             job.acquired_by = scheduler_id
             job.acquired_until = acquired_until
+            job.acquired_token = token
+            jobs.append(attrs.evolve(job))
 
             # Increment the number of running jobs for this task
             task.running_jobs += 1
@@ -282,19 +297,41 @@ class MemoryDataStore(BaseDataStore):
             )
 
         # Discard the jobs that could not start
-        for job, result in job_results.items():
-            await self.release_job(scheduler_id, job, result)
+        for job, result in discarded:
+            await self._release_job(
+                scheduler_id,
+                job,
+                result,
+                decrement_running_job_count=False,
+            )
 
         return jobs
 
-    async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
+    async def _release_job(
+        self,
+        scheduler_id: str | None,
+        job: Job,
+        result: JobResult,
+        *,
+        decrement_running_job_count: bool = True,
+    ) -> None:
+        """Unconditionally release the stored job and publish the event.
+
+        Internal callers (re-acquisition discards, the abandoned job reaper and
+        lease clean-up) have already established ownership of the claim.
+
+        """
+        stored_job = self._jobs_by_id.get(result.job_id)
+        if stored_job is None:
+            return
+
         # Record the job result
         if result.expires_at > result.finished_at:
             self._job_results[result.job_id] = result
 
         # Decrement the number of running jobs for this task
-        if job.acquired_by:
-            self._tasks[job.task_id].running_jobs -= 1
+        if decrement_running_job_count and stored_job.acquired_by:
+            self._tasks[stored_job.task_id].running_jobs -= 1
 
         # Delete the job
         job = self._jobs_by_id.pop(result.job_id)
@@ -324,6 +361,33 @@ class MemoryDataStore(BaseDataStore):
             )
         )
 
+    async def release_job(
+        self, scheduler_id: str, job: Job, result: JobResult
+    ) -> None:
+        """Release the job only if the caller still holds its current claim.
+
+        A late release from a holder whose lease has since expired and whose job
+        has been acquired by another holder (possibly the same scheduler identity
+        after a restart) is silently ignored, as is a duplicate release of a job
+        that has already been released.
+
+        """
+        stored_job = self._jobs_by_id.get(job.id)
+        if (
+            stored_job is None
+            or stored_job.acquired_by != scheduler_id
+            or stored_job.acquired_token != job.acquired_token
+        ):
+            self._logger.debug(
+                "Ignoring release of job %s from scheduler %r as it no longer "
+                "holds the lease on that job",
+                job.id,
+                scheduler_id,
+            )
+            return
+
+        await self._release_job(scheduler_id, job, result)
+
     async def get_job_result(self, job_id: UUID) -> JobResult | None:
         return self._job_results.pop(job_id, None)
 
@@ -336,12 +400,24 @@ class MemoryDataStore(BaseDataStore):
                 schedule.acquired_until = acquired_until
 
     async def extend_acquired_job_leases(
-        self, scheduler_id: str, job_ids: set[UUID], duration: timedelta
+        self, scheduler_id: str, jobs: Collection[Job], duration: timedelta
     ) -> None:
+        """Extend leases only on claims still held by the given scheduler.
+
+        Claims are identified by the per-acquisition token, so a late lease
+        extension from a holder that has lost the claim can never affect a newer
+        claim on the same job.
+
+        """
         acquired_until = datetime.now(timezone.utc) + duration
-        for job in self._jobs_by_id.values():
-            if job.acquired_by == scheduler_id and job.id in job_ids:
-                job.acquired_until = acquired_until
+        for job in jobs:
+            stored_job = self._jobs_by_id.get(job.id)
+            if (
+                stored_job is not None
+                and stored_job.acquired_by == scheduler_id
+                and stored_job.acquired_token == job.acquired_token
+            ):
+                stored_job.acquired_until = acquired_until
 
     async def reap_abandoned_jobs(self, scheduler_id: str) -> None:
         now = datetime.now(timezone.utc)
@@ -350,7 +426,7 @@ class MemoryDataStore(BaseDataStore):
                 result = JobResult.from_job(
                     job=job, outcome=JobOutcome.abandoned, finished_at=now
                 )
-                await self.release_job(job.acquired_by, job, result)
+                await self._release_job(scheduler_id, job, result)
 
     async def cleanup(self) -> None:
         # Clean up expired job results
@@ -374,7 +450,7 @@ class MemoryDataStore(BaseDataStore):
                 job=job, outcome=JobOutcome.abandoned, finished_at=now
             )
             assert job.acquired_by is not None
-            await self.release_job(job.acquired_by, job, result)
+            await self._release_job(job.acquired_by, job, result)
 
         # Release any schedules whose leases have expired
         for schedule in self._schedules:

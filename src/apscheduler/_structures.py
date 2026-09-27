@@ -317,6 +317,11 @@ class Job:
     acquired_until: datetime | None = attrs.field(
         converter=as_aware_datetime, default=None, repr=False
     )
+    acquired_token: UUID | None = attrs.field(
+        default=None,
+        validator=optional(instance_of(UUID)),
+        repr=False,
+    )
 
     @property
     def original_scheduled_time(self) -> datetime | None:
@@ -333,6 +338,7 @@ class Job:
         if not self.acquired_by:
             del marshalled["acquired_by"]
             del marshalled["acquired_until"]
+            del marshalled["acquired_token"]
 
         return marshalled
 

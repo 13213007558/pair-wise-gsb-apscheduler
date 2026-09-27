@@ -3,15 +3,17 @@ from __future__ import annotations
 import operator
 from collections.abc import (
     Callable,
+    Collection,
     Iterable,
     Mapping,
     Sequence,
 )
+from collections import defaultdict
 from contextlib import AsyncExitStack
 from datetime import datetime, timedelta, timezone
 from logging import Logger
 from typing import Any, ClassVar, TypeVar, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import attrs
 import pymongo
@@ -547,61 +549,40 @@ class MongoDBDataStore(BaseExternalDataStore):
                     self._client.start_session()
                 )
 
-                # Fetch up to {limit} jobs
                 now = datetime.now(timezone.utc)
-                async with self._jobs.find(
-                    {
-                        "$or": [
-                            {"acquired_until": {"$exists": False}},
-                            {"acquired_until": {"$lt": now.timestamp()}},
-                        ]
-                    },
-                    sort=[("created_at", ASCENDING)],
-                    limit=limit,
-                    session=session,
-                ) as cursor:
-                    documents = [doc async for doc in cursor]
-
-                # Mark them as acquired by this scheduler
                 acquired_until = now + lease_duration
-                job_ids = [doc["_id"] for doc in documents]
-                result = await self._jobs.update_many(
-                    {
-                        "_id": {"$in": job_ids},
+                acquired_jobs: list[Job] = []
+                slots_left: dict[str, float] = defaultdict(lambda: float("inf"))
+                full_task_ids: set[str] = set()
+                while limit is None or len(acquired_jobs) < limit:
+                    # Find the next due job that has not been processed yet
+                    query: dict[str, Any] = {
                         "$or": [
                             {"acquired_until": {"$exists": False}},
                             {"acquired_until": {"$lt": now.timestamp()}},
-                        ],
-                    },
-                    {
-                        "$set": {
-                            "acquired_by": scheduler_id,
-                            **marshal_timestamp(acquired_until, "acquired_until"),
-                        }
-                    },
-                )
-
-                # If the number of modified jobs was smaller than expected, manually
-                # check which jobs were successfully acquired
-                if result.modified_count != len(job_ids):
-                    async with self._jobs.find(
-                        {
-                            "_id": {"$in": job_ids},
-                            "acquired_by": scheduler_id,
-                        },
-                        sort=[("created_at", ASCENDING)],
-                        projection=["_id"],
-                        session=session,
-                    ) as cursor:
-                        acquired_job_ids = {doc["_id"] async for doc in cursor}
-                        documents = [
-                            doc for doc in documents if doc["_id"] in acquired_job_ids
                         ]
+                    }
+                    handled_ids = {job.id for job in acquired_jobs}
+                    handled_ids.update(event.job_id for event in events)
+                    if handled_ids:
+                        query["_id"] = {"$nin": list(handled_ids)}
+                    if full_task_ids:
+                        query["task_id"] = {"$nin": list(full_task_ids)}
 
-                acquired_jobs: list[Job] = []
-                skipped_job_ids: list[UUID] = []
-                for doc in documents:
-                    # Deserialize the job
+                    doc = await self._jobs.find_one(
+                        query,
+                        sort=[("created_at", ASCENDING)],
+                        session=session,
+                    )
+                    if doc is None:
+                        break
+
+                    old_token = doc.get("acquired_token")
+                    expired_claim = old_token is not None
+                    job_id = doc["_id"]
+                    task_id = doc["task_id"]
+
+                    # Deserialize the job before deciding what to do with it
                     doc["id"] = doc.pop("_id")
                     unmarshal_timestamps(doc)
                     try:
@@ -609,95 +590,145 @@ class MongoDBDataStore(BaseExternalDataStore):
                     except DeserializationError as exc:
                         # Deserialization failed, so record the exception as the job
                         # result
-                        result = JobResult(
-                            job_id=doc["id"],
-                            outcome=JobOutcome.missed_start_deadline,
+                        job_result = JobResult(
+                            job_id=job_id,
+                            outcome=JobOutcome.deserialization_failed,
                             finished_at=now,
                             expires_at=now
                             + timedelta(seconds=doc["result_expiration_time"]),
                             exception=exc,
                         )
-                        events.append(
-                            await self._release_job(
-                                session,
-                                result,
-                                scheduler_id,
-                                doc["task_id"],
-                                doc["schedule_id"],
-                                doc["scheduled_fire_time"],
-                                decrement_running_job_count=False,
-                            )
+                        event = await self._release_job(
+                            session,
+                            job_result,
+                            scheduler_id,
+                            task_id,
+                            doc["schedule_id"],
+                            doc["scheduled_fire_time"],
+                            decrement_running_job_count=False,
+                            claim_filter=(
+                                {"acquired_token": old_token}
+                                if expired_claim
+                                else None
+                            ),
                         )
+                        if event is not None:
+                            events.append(event)
                         continue
 
                     # Discard the job if its start deadline has passed
                     if job.start_deadline and job.start_deadline < now:
-                        result = JobResult.from_job(
+                        job_result = JobResult.from_job(
                             job,
                             JobOutcome.missed_start_deadline,
                             finished_at=now,
                         )
-                        events.append(
-                            await self._release_job(
-                                session,
-                                result,
-                                scheduler_id,
-                                job.task_id,
-                                job.schedule_id,
-                                job.scheduled_fire_time,
-                                decrement_running_job_count=False,
-                            )
+                        event = await self._release_job(
+                            session,
+                            job_result,
+                            scheduler_id,
+                            job.task_id,
+                            job.schedule_id,
+                            job.scheduled_fire_time,
+                            decrement_running_job_count=False,
+                            claim_filter=(
+                                {"acquired_token": old_token}
+                                if expired_claim
+                                else None
+                            ),
                         )
+                        if event is not None:
+                            events.append(event)
                         continue
 
-                    # Try to increment the task's running jobs count
-                    update_task_result = await self._tasks.update_one(
-                        {
-                            "_id": job.task_id,
-                            "$or": [
-                                {"max_running_jobs": None},
-                                {
-                                    "$expr": {
-                                        "$gt": [
-                                            "$max_running_jobs",
-                                            "$running_jobs",
-                                        ]
-                                    }
-                                },
-                            ],
-                        },
-                        {"$inc": {"running_jobs": 1}},
-                        session=session,
-                    )
-                    if not update_task_result.matched_count:
+                    if slots_left[job.task_id] == float("inf"):
+                        task_doc = await self._tasks.find_one(
+                            {"_id": job.task_id}, session=session
+                        )
+                        max_running_jobs = task_doc["max_running_jobs"]
+                        if max_running_jobs is not None:
+                            slots_left[job.task_id] = (
+                                max_running_jobs - task_doc["running_jobs"]
+                            ) + (1 if expired_claim else 0)
+
+                    # Skip the job if no more slots are available
+                    if slots_left[job.task_id] <= 0:
                         self._logger.debug(
-                            "Skipping job %s because task %r has the maximum number of "
-                            "jobs already running",
+                            "Skipping job %s because task %r has the maximum number "
+                            "of jobs already running",
                             job.id,
                             job.task_id,
                         )
-                        skipped_job_ids.append(job.id)
+                        if expired_claim:
+                            # Revert the expired claim so the job appears unclaimed
+                            # while it waits for a slot to free up.
+                            reset_result = await self._jobs.update_one(
+                                {"_id": job_id, "acquired_token": old_token},
+                                {
+                                    "$unset": {
+                                        "acquired_by": True,
+                                        "acquired_until": True,
+                                        "acquired_until_utcoffset": True,
+                                        "acquired_token": True,
+                                    }
+                                },
+                                session=session,
+                            )
+                            if reset_result.matched_count:
+                                await self._tasks.update_one(
+                                    {"_id": job.task_id},
+                                    {"$inc": {"running_jobs": -1}},
+                                    session=session,
+                                )
+                        # Do not acquire any more jobs for this task in this run,
+                        # but keep processing jobs belonging to other tasks.
+                        full_task_ids.add(job.task_id)
                         continue
 
-                    job.acquired_by = scheduler_id
-                    job.acquired_until = now + lease_duration
-                    acquired_jobs.append(job)
-                    events.append(JobAcquired.from_job(job, scheduler_id=scheduler_id))
+                    # Atomically claim the job (only if the stored claim still
+                    # matches the one we inspected)
+                    token = uuid4()
+                    claim_filter: dict[str, Any] = {"_id": job_id}
+                    if expired_claim:
+                        claim_filter["acquired_token"] = old_token
+                    else:
+                        # Guard against another scheduler claiming the job between
+                        # the find and this update.
+                        claim_filter["acquired_until"] = {"$exists": False}
 
-                # Release jobs skipped due to max job slots being reached
-                if skipped_job_ids:
-                    await self._jobs.update_many(
+                    update_result = await self._jobs.update_one(
+                        claim_filter,
                         {
-                            "_id": {"$in": skipped_job_ids},
-                            "acquired_by": scheduler_id,
+                            "$set": {
+                                "acquired_by": scheduler_id,
+                                "acquired_token": token,
+                                **marshal_timestamp(
+                                    acquired_until, "acquired_until"
+                                ),
+                            }
                         },
-                        {
-                            "$unset": {
-                                "acquired_by": True,
-                                "acquired_until": True,
-                                "acquired_until_utcoffset": True,
-                            },
-                        },
+                        session=session,
+                    )
+                    if not update_result.matched_count:
+                        # Another scheduler claimed the job first; the rest of the
+                        # queue needs to be re-evaluated.
+                        continue
+
+                    # Taking over an expired claim keeps the old slot; a fresh claim
+                    # consumes a new one.
+                    if not expired_claim:
+                        await self._tasks.update_one(
+                            {"_id": job.task_id},
+                            {"$inc": {"running_jobs": 1}},
+                            session=session,
+                        )
+                    slots_left[job.task_id] -= 1
+                    job.acquired_by = scheduler_id
+                    job.acquired_until = acquired_until
+                    job.acquired_token = token
+                    acquired_jobs.append(job)
+                    events.append(
+                        JobAcquired.from_job(job, scheduler_id=scheduler_id)
                     )
 
         # Publish the appropriate events
@@ -716,16 +747,25 @@ class MongoDBDataStore(BaseExternalDataStore):
         scheduled_fire_time: datetime | None = None,
         *,
         decrement_running_job_count: bool = True,
-    ) -> JobReleased:
+        claim_filter: Mapping[str, Any] | None = None,
+    ) -> JobReleased | None:
+        # Delete the job (only if the claim still matches, to prevent a late
+        # release from clobbering a newer acquisition of the same job)
+        delete_filter: dict[str, Any] = {"_id": result.job_id}
+        if claim_filter is not None:
+            delete_filter.update(claim_filter)
+        delete_result = await self._jobs.delete_one(
+            delete_filter, session=session
+        )
+        if not delete_result.deleted_count:
+            return None
+
         # Record the job result
         if result.expires_at > result.finished_at:
             document = result.marshal(self.serializer)
             document["_id"] = document.pop("job_id")
             marshal_document(document)
             await self._jobs_results.insert_one(document, session=session)
-
-        # Delete the job
-        await self._jobs.delete_one({"_id": result.job_id}, session=session)
 
         # Decrement the running jobs counter if the job had been successfully acquired
         if decrement_running_job_count:
@@ -751,10 +791,22 @@ class MongoDBDataStore(BaseExternalDataStore):
                         job.task_id,
                         job.schedule_id,
                         job.scheduled_fire_time,
+                        claim_filter={
+                            "acquired_by": scheduler_id,
+                            "acquired_token": job.acquired_token,
+                        },
                     )
 
                     # Notify other schedulers
-                    await self._event_broker.publish(event)
+                    if event is not None:
+                        await self._event_broker.publish(event)
+                    else:
+                        self._logger.debug(
+                            "Ignoring release of job %s from scheduler %r as it no "
+                            "longer holds the lease on that job",
+                            job.id,
+                            scheduler_id,
+                        )
 
     async def get_job_result(self, job_id: UUID) -> JobResult | None:
         async for attempt in self._retry():
@@ -787,22 +839,29 @@ class MongoDBDataStore(BaseExternalDataStore):
                     )
 
     async def extend_acquired_job_leases(
-        self, scheduler_id: str, job_ids: set[UUID], duration: timedelta
+        self, scheduler_id: str, jobs: Collection[Job], duration: timedelta
     ) -> None:
+        if not jobs:
+            return
+
         async for attempt in self._retry():
             with attempt:
                 async with self._client.start_session() as session:
                     new_acquired_until = (
                         datetime.now(timezone.utc) + duration
                     ).timestamp()
-                    await self._jobs.update_many(
-                        filter={
-                            "acquired_by": scheduler_id,
-                            "_id": {"$in": list(job_ids)},
-                        },
-                        update={"$set": {"acquired_until": new_acquired_until}},
-                        session=session,
-                    )
+                    for job in jobs:
+                        await self._jobs.update_one(
+                            filter={
+                                "acquired_by": scheduler_id,
+                                "_id": job.id,
+                                "acquired_token": job.acquired_token,
+                            },
+                            update={
+                                "$set": {"acquired_until": new_acquired_until}
+                            },
+                            session=session,
+                        )
 
     async def reap_abandoned_jobs(self, scheduler_id: str) -> None:
         async for attempt in self._retry():
@@ -830,7 +889,8 @@ class MongoDBDataStore(BaseExternalDataStore):
                             job.schedule_id,
                             job.scheduled_fire_time,
                         )
-                        events.append(event)
+                        if event is not None:
+                            events.append(event)
 
             for event in events:
                 await self._event_broker.publish(event)
@@ -887,16 +947,16 @@ class MongoDBDataStore(BaseExternalDataStore):
                                 expires_at=now
                                 + timedelta(seconds=doc["result_expiration_time"]),
                             )
-                            events.append(
-                                await self._release_job(
-                                    session,
-                                    result,
-                                    doc["acquired_by"],
-                                    doc["task_id"],
-                                    doc["schedule_id"],
-                                    doc["scheduled_fire_time"],
-                                )
+                            event = await self._release_job(
+                                session,
+                                result,
+                                doc["acquired_by"],
+                                doc["task_id"],
+                                doc["schedule_id"],
+                                doc["scheduled_fire_time"],
                             )
+                            if event is not None:
+                                events.append(event)
 
                     # Release any schedules whose leases have expired
                     expired_schedule_ids: list[str] = []

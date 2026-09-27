@@ -11,7 +11,7 @@ from contextlib import AsyncExitStack
 from datetime import datetime, timedelta, timezone
 from logging import Logger
 from typing import Any, ClassVar, TypeVar, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import attrs
 import pymongo
@@ -564,6 +564,7 @@ class MongoDBDataStore(BaseExternalDataStore):
 
                 # Mark them as acquired by this scheduler
                 acquired_until = now + lease_duration
+                lease_token = uuid4()
                 job_ids = [doc["_id"] for doc in documents]
                 result = await self._jobs.update_many(
                     {
@@ -576,6 +577,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                     {
                         "$set": {
                             "acquired_by": scheduler_id,
+                            "lease_token": lease_token,
                             **marshal_timestamp(acquired_until, "acquired_until"),
                         }
                     },
@@ -597,6 +599,18 @@ class MongoDBDataStore(BaseExternalDataStore):
                         documents = [
                             doc for doc in documents if doc["_id"] in acquired_job_ids
                         ]
+
+                # Reclaim the running job slots from the previous holders of any jobs
+                # whose leases had expired
+                reclaimed_task_ids = [
+                    doc["task_id"] for doc in documents if "acquired_until" in doc
+                ]
+                for task_id in reclaimed_task_ids:
+                    await self._tasks.update_one(
+                        {"_id": task_id},
+                        {"$inc": {"running_jobs": -1}},
+                        session=session,
+                    )
 
                 acquired_jobs: list[Job] = []
                 skipped_job_ids: list[UUID] = []
@@ -681,6 +695,7 @@ class MongoDBDataStore(BaseExternalDataStore):
 
                     job.acquired_by = scheduler_id
                     job.acquired_until = now + lease_duration
+                    job.lease_token = lease_token
                     acquired_jobs.append(job)
                     events.append(JobAcquired.from_job(job, scheduler_id=scheduler_id))
 
@@ -696,6 +711,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                                 "acquired_by": True,
                                 "acquired_until": True,
                                 "acquired_until_utcoffset": True,
+                                "lease_token": True,
                             },
                         },
                     )
@@ -741,11 +757,45 @@ class MongoDBDataStore(BaseExternalDataStore):
         )
 
     async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
+        if job.lease_token is None:
+            self._logger.info(
+                "Not releasing job %s: the job holds no valid lease", result.job_id
+            )
+            return
+
         async for attempt in self._retry():
             with attempt:
                 async with self._client.start_session() as session:
-                    event = await self._release_job(
-                        session,
+                    # Delete the job, but only if the lease token still matches (that
+                    # is, the caller is still the current holder of the job's lease)
+                    delete_result = await self._jobs.delete_one(
+                        {"_id": result.job_id, "lease_token": job.lease_token},
+                        session=session,
+                    )
+                    if not delete_result.deleted_count:
+                        self._logger.info(
+                            "Not releasing job %s: the lease held by %r is no longer "
+                            "valid",
+                            result.job_id,
+                            scheduler_id,
+                        )
+                        return
+
+                    # Record the job result
+                    if result.expires_at > result.finished_at:
+                        document = result.marshal(self.serializer)
+                        document["_id"] = document.pop("job_id")
+                        marshal_document(document)
+                        await self._jobs_results.insert_one(document, session=session)
+
+                    # Decrement the running jobs counter
+                    await self._tasks.find_one_and_update(
+                        {"_id": job.task_id},
+                        {"$inc": {"running_jobs": -1}},
+                        session=session,
+                    )
+
+                    event = JobReleased.from_result(
                         result,
                         scheduler_id,
                         job.task_id,

@@ -6,6 +6,13 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **UNRELEASED**
 
+- **BREAKING** Fixed a race condition where a worker whose job lease had expired could
+  release a job that had since been re-acquired by another worker, deleting the job,
+  recording a stale result and corrupting the task's running jobs counter. Job
+  acquisitions now carry a lease token which is validated when releasing a job, so
+  stale releases and lease extensions no longer affect the current holder. The
+  SQLAlchemy data store schema was bumped to version 2 (existing version 1 schemas are
+  migrated automatically)
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+

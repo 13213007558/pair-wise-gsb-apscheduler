@@ -6,6 +6,7 @@ import random
 import sys
 from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from contextlib import AsyncExitStack
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from inspect import isbuiltin, isclass, ismethod, ismodule
@@ -562,6 +563,138 @@ class AsyncScheduler:
             schedule.next_fire_time,
         )
         return schedule.id
+
+    async def add_schedules(
+        self,
+        schedules: Iterable[Schedule],
+        *,
+        tasks: Iterable[Task] = (),
+        conflict_policy: ConflictPolicy = ConflictPolicy.do_nothing,
+    ) -> list[str]:
+        """
+        Add a batch of schedules (and optionally, task definitions) to the data
+        store as a single atomic operation.
+
+        This is useful when deploying a set of interdependent schedules that
+        should become visible to schedulers all at once, rather than exposing
+        intermediate states where only some of the schedules exist.
+
+        The batch is all-or-nothing: if any part of it fails (invalid input, a
+        trigger that cannot produce its first fire time, a conflicting schedule ID
+        or a data store error), the data store is left completely unchanged – no
+        new tasks are left behind, no existing task configurations are modified
+        and no existing schedules are replaced halfway. Events representing the
+        changes are published only after the batch has been successfully
+        committed, so subscribers never observe changes that could still be
+        rolled back.
+
+        The triggers contained in the given schedules are never modified; the
+        first fire time of each schedule is computed on an internal copy of the
+        trigger, so a failed batch cannot irreversibly advance trigger objects
+        held by the caller.
+
+        An empty batch (no schedules and no tasks) is a no-op that returns an
+        empty list.
+
+        .. note:: Not all data stores support atomic batches. Data stores that
+            don't will raise :exc:`NotImplementedError`.
+
+        :param schedules: the schedules to add
+        :param tasks: task definitions to add or update along with the schedules
+            (for any schedule whose task is neither supplied here nor already
+            present in the data store, a new task is implicitly created with the
+            scheduler's default task settings)
+        :param conflict_policy: determines what to do if a schedule with the same
+            ID already exists in the data store
+        :raises TypeError: if an item in `schedules` is not a
+            :class:`~apscheduler.Schedule` or an item in `tasks` is not a
+            :class:`~apscheduler.Task`
+        :raises ValueError: if the batch contains duplicate schedule or task IDs
+        :raises ConflictingIdError: if `conflict_policy` is `exception` and a
+            schedule with the same ID as one in the batch already exists
+        :return: the IDs of the schedules in the batch, in the order they were
+            given
+
+        """
+        self._check_initialized()
+        schedule_list = list(schedules)
+        task_list = list(tasks)
+        for schedule in schedule_list:
+            if not isinstance(schedule, Schedule):
+                raise TypeError(
+                    f"schedules must contain only Schedule instances, got {schedule!r}"
+                )
+
+        for task in task_list:
+            if not isinstance(task, Task):
+                raise TypeError(f"tasks must contain only Task instances, got {task!r}")
+
+        schedule_ids = [schedule.id for schedule in schedule_list]
+        if len(set(schedule_ids)) != len(schedule_ids):
+            duplicates = sorted(
+                {id_ for id_ in schedule_ids if schedule_ids.count(id_) > 1}
+            )
+            raise ValueError(
+                f"duplicate schedule IDs in batch: {', '.join(duplicates)}"
+            )
+
+        task_ids = [task.id for task in task_list]
+        if len(set(task_ids)) != len(task_ids):
+            duplicates = sorted({id_ for id_ in task_ids if task_ids.count(id_) > 1})
+            raise ValueError(f"duplicate task IDs in batch: {', '.join(duplicates)}")
+
+        if not schedule_list and not task_list:
+            return []
+
+        # Resolve the tasks required by the schedules. Any task that is neither
+        # explicitly supplied nor already in the data store is created with the
+        # default task settings, but only committed as part of the atomic batch.
+        tasks_by_id: dict[str, Task] = {task.id: task for task in task_list}
+        new_tasks: list[Task] = []
+        for schedule in schedule_list:
+            task_id = schedule.task_id
+            if task_id in tasks_by_id or any(t.id == task_id for t in new_tasks):
+                continue
+
+            try:
+                await self.data_store.get_task(task_id)
+            except TaskLookupError:
+                new_tasks.append(
+                    Task(
+                        id=task_id,
+                        func=None,
+                        job_executor=cast(str, self.task_defaults.job_executor),
+                        max_running_jobs=cast(
+                            "int | None", self.task_defaults.max_running_jobs
+                        ),
+                        misfire_grace_time=self.task_defaults.misfire_grace_time,
+                        metadata=dict(self.task_defaults.metadata),
+                    )
+                )
+
+        # Compute the first fire time of each schedule on a copy of its trigger,
+        # so that the caller's trigger objects are never advanced, not even by a
+        # successful batch
+        final_schedules: list[Schedule] = []
+        for schedule in schedule_list:
+            trigger = deepcopy(schedule.trigger)
+            next_fire_time = trigger.next()
+            new_schedule = attrs.evolve(schedule, trigger=trigger)
+            new_schedule.next_fire_time = next_fire_time
+            final_schedules.append(new_schedule)
+
+        await self.data_store.add_schedules(
+            final_schedules, conflict_policy, tasks=[*task_list, *new_tasks]
+        )
+        for schedule in final_schedules:
+            self.logger.info(
+                "Added new schedule (task=%r, trigger=%r); next run time at %s",
+                schedule.task_id,
+                schedule.trigger,
+                schedule.next_fire_time,
+            )
+
+        return [schedule.id for schedule in final_schedules]
 
     async def get_schedule(self, id: str) -> Schedule:
         """

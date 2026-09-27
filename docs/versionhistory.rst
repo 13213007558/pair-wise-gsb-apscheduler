@@ -6,6 +6,14 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **UNRELEASED**
 
+- Added the ability to add a batch of schedules (and optionally task definitions)
+  atomically via ``AsyncScheduler.add_schedules()`` and
+  ``Scheduler.add_schedules()``, along with the corresponding
+  ``DataStore.add_schedules()`` data store method. The batch is applied as a
+  single all-or-nothing operation and events are only published after a
+  successful commit. The memory and SQLAlchemy data stores support atomic
+  batches; data stores that cannot guarantee atomicity (such as the MongoDB data
+  store) explicitly raise ``NotImplementedError``
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+

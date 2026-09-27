@@ -16,6 +16,7 @@ from pytest_mock.plugin import MockerFixture
 
 from apscheduler import (
     CoalescePolicy,
+    ConflictingIdError,
     ConflictPolicy,
     DeserializationError,
     Event,
@@ -209,6 +210,370 @@ async def test_remove_schedules(
     assert received_event.schedule_id == "s2"
 
     assert not events
+
+
+async def test_add_schedules_batch(
+    datastore: DataStore, schedules: list[Schedule]
+) -> None:
+    tasks = [
+        Task(id="task1", func="builtins:print", job_executor="async"),
+        Task(id="task2", func="math:ceil", job_executor="async"),
+    ]
+    event_types = {TaskAdded, ScheduleAdded}
+    async with capture_events(datastore, 5, event_types) as events:
+        await datastore.add_schedules(schedules, ConflictPolicy.exception, tasks=tasks)
+
+        assert await datastore.get_schedules() == schedules
+        assert [task.id for task in await datastore.get_tasks()] == [
+            "task1",
+            "task2",
+        ]
+
+    # Events are published only after the whole batch has been committed, tasks
+    # first, then schedules
+    received_event = events.pop(0)
+    assert isinstance(received_event, TaskAdded)
+    assert received_event.task_id == "task1"
+
+    received_event = events.pop(0)
+    assert isinstance(received_event, TaskAdded)
+    assert received_event.task_id == "task2"
+
+    for event, schedule in zip(events, schedules, strict=True):
+        assert isinstance(event, ScheduleAdded)
+        assert event.schedule_id == schedule.id
+        assert event.task_id == schedule.task_id
+        assert event.next_fire_time == schedule.next_fire_time
+
+
+async def test_add_schedules_batch_empty(datastore: DataStore) -> None:
+    async with capture_events(datastore, 0) as events:
+        await datastore.add_schedules([], ConflictPolicy.exception)
+        await datastore.add_schedules([], ConflictPolicy.exception, tasks=[])
+
+    assert not events
+    assert await datastore.get_schedules() == []
+    assert await datastore.get_tasks() == []
+
+
+async def test_add_schedules_batch_duplicate_ids(
+    datastore: DataStore, schedules: list[Schedule]
+) -> None:
+    async with capture_events(datastore, 0) as events:
+        with pytest.raises(ValueError, match="duplicate schedule IDs"):
+            await datastore.add_schedules(
+                [schedules[0], schedules[0]], ConflictPolicy.exception
+            )
+
+        tasks = [
+            Task(id="task1", func="builtins:print", job_executor="async"),
+            Task(id="task1", func="math:ceil", job_executor="async"),
+        ]
+        with pytest.raises(ValueError, match="duplicate task IDs"):
+            await datastore.add_schedules(
+                schedules, ConflictPolicy.exception, tasks=tasks
+            )
+
+    assert not events
+    assert await datastore.get_schedules() == []
+    assert await datastore.get_tasks() == []
+
+
+async def test_add_schedules_batch_conflict_exception(
+    datastore: DataStore, schedules: list[Schedule]
+) -> None:
+    await datastore.add_schedule(schedules[0], ConflictPolicy.exception)
+
+    trigger = DateTrigger(datetime(2020, 9, 16, tzinfo=timezone.utc))
+    replacement = Schedule(
+        id="s1", task_id="task1", job_executor="async", trigger=trigger
+    )
+    replacement.next_fire_time = trigger.next()
+    event_types = {ScheduleAdded, ScheduleUpdated}
+    async with capture_events(datastore, 0, event_types) as events:
+        with pytest.raises(ConflictingIdError):
+            await datastore.add_schedules(
+                [replacement, schedules[1]], ConflictPolicy.exception
+            )
+
+        # The existing schedule must be left untouched, and the rest of the batch
+        # must not have been added
+        assert await datastore.get_schedules() == [schedules[0]]
+
+    assert not events
+
+
+async def test_add_schedules_batch_conflict_do_nothing(
+    datastore: DataStore, schedules: list[Schedule]
+) -> None:
+    await datastore.add_schedule(schedules[0], ConflictPolicy.exception)
+
+    trigger = DateTrigger(datetime(2020, 9, 16, tzinfo=timezone.utc))
+    replacement = Schedule(
+        id="s1", task_id="task1", job_executor="async", trigger=trigger
+    )
+    replacement.next_fire_time = trigger.next()
+    async with capture_events(datastore, 1, {ScheduleAdded}) as events:
+        await datastore.add_schedules(
+            [replacement, schedules[1]], ConflictPolicy.do_nothing
+        )
+
+        # The conflicting schedule is kept as-is, the rest of the batch is added
+        assert await datastore.get_schedules() == [schedules[0], schedules[1]]
+
+    received_event = events.pop(0)
+    assert isinstance(received_event, ScheduleAdded)
+    assert received_event.schedule_id == "s2"
+    assert not events
+
+
+async def test_add_schedules_batch_conflict_replace(
+    datastore: DataStore, schedules: list[Schedule]
+) -> None:
+    await datastore.add_schedule(schedules[0], ConflictPolicy.exception)
+
+    trigger = DateTrigger(datetime(2020, 9, 16, tzinfo=timezone.utc))
+    replacement = Schedule(
+        id="s1", task_id="task1", job_executor="async", trigger=trigger
+    )
+    replacement.next_fire_time = trigger.next()
+    event_types = {ScheduleAdded, ScheduleUpdated}
+    async with capture_events(datastore, 2, event_types) as events:
+        await datastore.add_schedules(
+            [replacement, schedules[1]], ConflictPolicy.replace
+        )
+
+        stored = await datastore.get_schedules({"s1"})
+        assert stored == [replacement]
+        assert stored[0].next_fire_time == datetime(2020, 9, 16, tzinfo=timezone.utc)
+        assert await datastore.get_schedules({"s2"}) == [schedules[1]]
+
+    received_event = events.pop(0)
+    assert isinstance(received_event, ScheduleUpdated)
+    assert received_event.schedule_id == "s1"
+
+    received_event = events.pop(0)
+    assert isinstance(received_event, ScheduleAdded)
+    assert received_event.schedule_id == "s2"
+    assert not events
+
+
+async def test_add_schedules_batch_update_task(
+    datastore: DataStore, schedules: list[Schedule]
+) -> None:
+    await datastore.add_task(
+        Task(id="task1", func="builtins:print", job_executor="async")
+    )
+
+    updated_task = Task(id="task1", func="builtins:repr", job_executor="async")
+    async with capture_events(datastore, 1, {TaskUpdated}) as events:
+        await datastore.add_schedules(
+            [schedules[0]], ConflictPolicy.exception, tasks=[updated_task]
+        )
+
+        task = await datastore.get_task("task1")
+        assert task.func == "builtins:repr"
+
+    received_event = events.pop(0)
+    assert isinstance(received_event, TaskUpdated)
+    assert received_event.task_id == "task1"
+    assert not events
+
+
+async def test_add_schedules_batch_readback_independent_connection(
+    datastore: DataStore, schedules: list[Schedule]
+) -> None:
+    """
+    Test that a committed batch is visible to a separate connection to the same
+    database.
+
+    """
+    if not isinstance(datastore, SQLAlchemyDataStore) or (
+        datastore._engine.dialect.name != "sqlite"
+    ):
+        pytest.skip("independent connection read-back requires SQLite")
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    tasks = [
+        Task(id="task1", func="builtins:print", job_executor="async"),
+        Task(id="task2", func="math:ceil", job_executor="async"),
+    ]
+    await datastore.add_schedules(schedules, ConflictPolicy.exception, tasks=tasks)
+
+    database = datastore._engine.url.database
+    engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(text("SELECT id FROM tasks ORDER BY id"))
+            assert [row[0] for row in result] == ["task1", "task2"]
+
+            result = await conn.execute(text("SELECT id FROM schedules ORDER BY id"))
+            assert [row[0] for row in result] == ["s1", "s2", "s3"]
+    finally:
+        await engine.dispose()
+
+
+# The batch writes, in order: SELECT tasks, UPDATE task1, INSERT task2,
+# SELECT schedules, INSERT s2, INSERT s3 – the failure is injected at each of
+# these positions in turn
+@pytest.mark.parametrize("fail_at", list(range(6)))
+async def test_add_schedules_batch_write_failure(
+    datastore: DataStore,
+    schedules: list[Schedule],
+    fail_at: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Test that a write failure at any point in the batch rolls the entire batch
+    back: pre-existing tasks and schedules are left untouched, no new rows remain
+    (verified through an independent connection) and no events are published.
+
+    """
+    if not isinstance(datastore, SQLAlchemyDataStore) or (
+        datastore._engine.dialect.name != "sqlite"
+    ):
+        pytest.skip("write failure injection requires the SQLAlchemy/SQLite store")
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    # Pre-existing state that must survive the failed batch untouched
+    await datastore.add_task(
+        Task(id="task1", func="builtins:print", job_executor="async")
+    )
+    await datastore.add_schedule(schedules[0], ConflictPolicy.exception)
+
+    original_execute = SQLAlchemyDataStore._execute
+    call_count = 0
+
+    async def failing_execute(self, conn, statement, parameters=None):
+        nonlocal call_count
+        try:
+            if call_count == fail_at:
+                raise RuntimeError("injected write failure")
+
+            return await original_execute(self, conn, statement, parameters)
+        finally:
+            call_count += 1
+
+    monkeypatch.setattr(SQLAlchemyDataStore, "_execute", failing_execute)
+
+    events: list[Event] = []
+    subscription = datastore._event_broker.subscribe(events.append)
+    try:
+        tasks = [
+            Task(id="task1", func="builtins:repr", job_executor="async"),
+            Task(id="task2", func="math:ceil", job_executor="async"),
+        ]
+        with pytest.raises(RuntimeError, match="injected write failure"):
+            await datastore.add_schedules(
+                schedules[1:], ConflictPolicy.exception, tasks=tasks
+            )
+    finally:
+        subscription.unsubscribe()
+
+    # No events may have been published for the rolled back batch
+    assert not events
+
+    # The pre-existing task must not have been modified, and no new tasks or
+    # schedules may remain
+    task = await datastore.get_task("task1")
+    assert task.func == "builtins:print"
+    assert [task.id for task in await datastore.get_tasks()] == ["task1"]
+    assert await datastore.get_schedules() == [schedules[0]]
+
+    # Verify the rollback through an independent connection as well
+    database = datastore._engine.url.database
+    engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(text("SELECT id, func FROM tasks ORDER BY id"))
+            assert [tuple(row) for row in result] == [("task1", "builtins:print")]
+
+            result = await conn.execute(text("SELECT id FROM schedules ORDER BY id"))
+            assert [row[0] for row in result] == ["s1"]
+    finally:
+        await engine.dispose()
+
+
+async def test_add_schedules_batch_unsupported_store() -> None:
+    """Test that data stores without atomic batch support explicitly refuse."""
+    datastore = MongoDBDataStore("mongodb://localhost/test")
+    with pytest.raises(NotImplementedError, match="does not support"):
+        await datastore.add_schedules([], ConflictPolicy.do_nothing)
+
+
+# The batch writes, in order: SELECT schedules, UPDATE s1, INSERT s2 – the
+# failure is injected at each of these positions in turn
+@pytest.mark.parametrize("fail_at", list(range(3)))
+async def test_add_schedules_batch_replace_rollback(
+    datastore: DataStore,
+    schedules: list[Schedule],
+    fail_at: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Test that a write failure during a batch that replaces an existing schedule
+    rolls back the replacement as well, leaving the original schedule intact.
+
+    """
+    if not isinstance(datastore, SQLAlchemyDataStore) or (
+        datastore._engine.dialect.name != "sqlite"
+    ):
+        pytest.skip("write failure injection requires the SQLAlchemy/SQLite store")
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    await datastore.add_schedule(schedules[0], ConflictPolicy.exception)
+
+    original_execute = SQLAlchemyDataStore._execute
+    call_count = 0
+
+    async def failing_execute(self, conn, statement, parameters=None):
+        nonlocal call_count
+        try:
+            if call_count == fail_at:
+                raise RuntimeError("injected write failure")
+
+            return await original_execute(self, conn, statement, parameters)
+        finally:
+            call_count += 1
+
+    monkeypatch.setattr(SQLAlchemyDataStore, "_execute", failing_execute)
+
+    events: list[Event] = []
+    subscription = datastore._event_broker.subscribe(events.append)
+    try:
+        trigger = DateTrigger(datetime(2020, 9, 16, tzinfo=timezone.utc))
+        replacement = Schedule(
+            id="s1", task_id="task1", job_executor="async", trigger=trigger
+        )
+        replacement.next_fire_time = trigger.next()
+        with pytest.raises(RuntimeError, match="injected write failure"):
+            await datastore.add_schedules(
+                [replacement, schedules[1]], ConflictPolicy.replace
+            )
+    finally:
+        subscription.unsubscribe()
+
+    # No events may have been published for the rolled back batch
+    assert not events
+
+    # The original schedule must be intact, and the new one must not exist
+    assert await datastore.get_schedules() == [schedules[0]]
+
+    # Verify the rollback through an independent connection as well
+    database = datastore._engine.url.database
+    engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(text("SELECT id FROM schedules ORDER BY id"))
+            assert [row[0] for row in result] == ["s1"]
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.skipif(

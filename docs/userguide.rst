@@ -437,6 +437,59 @@ If this trigger is created on 2022-06-07 at 09:00:00, its first run times would 
 
 Notably, 2022-08-07 is skipped because it falls on a Sunday.
 
+Adding schedules in bulk
+------------------------
+
+When deploying a set of interdependent schedules (for example during a deployment
+window), it is often undesirable to expose intermediate states where only some of
+the schedules exist. For this, you can use
+:meth:`AsyncScheduler.add_schedules` (or its synchronous counterpart
+:meth:`Scheduler.add_schedules`) which adds a whole batch of schedules – along
+with any task definitions you supply – as a single atomic operation::
+
+    from apscheduler import Schedule
+    from apscheduler.triggers.cron import CronTrigger
+
+    schedules = [
+        Schedule(id="morning", task_id="report", trigger=CronTrigger(hour=8),
+                 job_executor="threadpool"),
+        Schedule(id="evening", task_id="report", trigger=CronTrigger(hour=20),
+                 job_executor="threadpool"),
+    ]
+
+    # Asynchronous scheduler
+    async with AsyncScheduler() as scheduler:
+        schedule_ids = await scheduler.add_schedules(schedules)
+
+    # Synchronous scheduler
+    with Scheduler() as scheduler:
+        schedule_ids = scheduler.add_schedules(schedules)
+
+The batch is all-or-nothing: if any part of it fails (invalid input, duplicate
+schedule IDs within the batch, a trigger that cannot produce its first fire time,
+a conflicting schedule ID when using the ``exception`` conflict policy, or a data
+store error), the data store is left completely unchanged. No new tasks are left
+behind, no existing task configurations are modified and no existing schedules
+are replaced halfway. Likewise, the events representing the changes are published
+only after the batch has been successfully committed, so subscribers never
+observe changes that could still be rolled back.
+
+Any task referenced by a schedule in the batch that is neither supplied via the
+``tasks`` argument nor already present in the data store is implicitly created
+with the scheduler's default task settings.
+
+The triggers contained in the schedules are never modified by this method; the
+first fire time of each schedule is computed on an internal copy, so a failed
+batch cannot irreversibly advance trigger objects held by the caller.
+
+Passing an empty batch (no schedules and no tasks) is a no-op that simply returns
+an empty list.
+
+.. note:: Atomic batches are currently supported by the memory and SQLAlchemy
+    data stores. Data stores that cannot guarantee atomicity (such as the
+    MongoDB data store) explicitly raise :exc:`NotImplementedError` instead of
+    emulating batches with a loop of individual writes.
+
 Removing schedules
 ------------------
 

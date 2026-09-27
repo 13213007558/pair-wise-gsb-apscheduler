@@ -127,6 +127,72 @@ class MemoryDataStore(BaseDataStore):
 
         await self._event_broker.publish(event)
 
+    async def add_schedules(
+        self,
+        schedules: Sequence[Schedule],
+        conflict_policy: ConflictPolicy,
+        *,
+        tasks: Sequence[Task] = (),
+    ) -> None:
+        schedule_ids = [schedule.id for schedule in schedules]
+        if len(set(schedule_ids)) != len(schedule_ids):
+            raise ValueError("duplicate schedule IDs in batch")
+
+        task_ids = [task.id for task in tasks]
+        if len(set(task_ids)) != len(task_ids):
+            raise ValueError("duplicate task IDs in batch")
+
+        # Validate the conflict policy up front so that the batch either applies
+        # fully or not at all
+        if conflict_policy is ConflictPolicy.exception:
+            for schedule in schedules:
+                if schedule.id in self._schedules_by_id:
+                    raise ConflictingIdError(schedule.id)
+
+        events: list[TaskAdded | TaskUpdated | ScheduleAdded | ScheduleUpdated] = []
+        for task in tasks:
+            if task.id in self._tasks:
+                task.running_jobs = self._tasks[task.id].running_jobs
+                self._tasks[task.id] = task
+                events.append(TaskUpdated(task_id=task.id))
+            else:
+                self._tasks[task.id] = task
+                events.append(TaskAdded(task_id=task.id))
+
+        for schedule in schedules:
+            old_schedule = self._schedules_by_id.get(schedule.id)
+            if old_schedule is not None:
+                if conflict_policy is ConflictPolicy.do_nothing:
+                    continue
+
+                index = self._find_schedule_index(old_schedule)
+                del self._schedules[index]
+                self._schedules_by_task_id[old_schedule.task_id].remove(old_schedule)
+
+            self._schedules_by_id[schedule.id] = schedule
+            self._schedules_by_task_id[schedule.task_id].add(schedule)
+            insort_right(self._schedules, schedule)
+
+            event: ScheduleUpdated | ScheduleAdded
+            if old_schedule is not None:
+                event = ScheduleUpdated(
+                    schedule_id=schedule.id,
+                    task_id=schedule.task_id,
+                    next_fire_time=schedule.next_fire_time,
+                )
+            else:
+                event = ScheduleAdded(
+                    schedule_id=schedule.id,
+                    task_id=schedule.task_id,
+                    next_fire_time=schedule.next_fire_time,
+                )
+
+            events.append(event)
+
+        # Publish events only after the entire batch has been applied
+        for batch_event in events:
+            await self._event_broker.publish(batch_event)
+
     async def remove_schedules(
         self, ids: Iterable[str], *, finished: bool = False
     ) -> None:

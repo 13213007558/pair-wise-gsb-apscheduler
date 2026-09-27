@@ -300,6 +300,37 @@ class Scheduler:
             )
         )
 
+    def add_schedules(
+        self,
+        schedules: Iterable[Schedule],
+        *,
+        tasks: Iterable[Task] = (),
+        conflict_policy: ConflictPolicy = ConflictPolicy.do_nothing,
+    ) -> list[str]:
+        """
+        Add a batch of schedules (and optionally, task definitions) to the data
+        store as a single atomic operation.
+
+        See :meth:`AsyncScheduler.add_schedules` for details.
+
+        :param schedules: the schedules to add
+        :param tasks: task definitions to add or update along with the schedules
+        :param conflict_policy: determines what to do if a schedule with the same
+            ID already exists in the data store
+        :return: the IDs of the schedules in the batch, in the order they were
+            given
+
+        """
+        portal = self._ensure_services_ready()
+        return portal.call(
+            partial(
+                self._async_scheduler.add_schedules,
+                schedules,
+                tasks=tasks,
+                conflict_policy=conflict_policy,
+            )
+        )
+
     def get_schedule(self, id: str) -> Schedule:
         portal = self._ensure_services_ready()
         return portal.call(self._async_scheduler.get_schedule, id)

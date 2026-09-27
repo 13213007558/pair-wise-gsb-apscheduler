@@ -308,6 +308,17 @@ class MongoDBDataStore(BaseExternalDataStore):
             )
             await self._event_broker.publish(event)
 
+    async def add_schedules(
+        self,
+        schedules: Sequence[Schedule],
+        conflict_policy: ConflictPolicy,
+        *,
+        tasks: Sequence[Task] = (),
+    ) -> None:
+        raise NotImplementedError(
+            "MongoDBDataStore does not support atomically adding multiple schedules"
+        )
+
     async def remove_schedules(self, ids: Iterable[str]) -> None:
         filters = {"_id": {"$in": list(ids)}} if ids is not None else {}
         async for attempt in self._retry():

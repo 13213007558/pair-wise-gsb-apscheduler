@@ -594,6 +594,107 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
             )
             await self._event_broker.publish(event)
 
+    async def add_schedules(
+        self,
+        schedules: Sequence[Schedule],
+        conflict_policy: ConflictPolicy,
+        *,
+        tasks: Sequence[Task] = (),
+    ) -> None:
+        schedule_ids = [schedule.id for schedule in schedules]
+        if len(set(schedule_ids)) != len(schedule_ids):
+            raise ValueError("duplicate schedule IDs in batch")
+
+        task_ids = [task.id for task in tasks]
+        if len(set(task_ids)) != len(task_ids):
+            raise ValueError("duplicate task IDs in batch")
+
+        if not schedules and not tasks:
+            return
+
+        events: list[DataStoreEvent] = []
+        async for attempt in self._retry():
+            with attempt:
+                events = []
+                async with self._begin_transaction() as conn:
+                    if tasks:
+                        query = select(self._t_tasks.c.id).where(
+                            self._t_tasks.c.id.in_(task_ids)
+                        )
+                        result = await self._execute(conn, query)
+                        existing_task_ids = {row[0] for row in result}
+                        for task in tasks:
+                            values: dict[str, Any] = {
+                                "func": task.func,
+                                "job_executor": task.job_executor,
+                                "max_running_jobs": task.max_running_jobs,
+                                "misfire_grace_time": task.misfire_grace_time,
+                                "metadata": task.metadata,
+                            }
+                            if task.id in existing_task_ids:
+                                update = (
+                                    self._t_tasks.update()
+                                    .where(self._t_tasks.c.id == task.id)
+                                    .values(**values)
+                                )
+                                await self._execute(conn, update)
+                                events.append(TaskUpdated(task_id=task.id))
+                            else:
+                                insert = self._t_tasks.insert().values(
+                                    id=task.id, **values
+                                )
+                                await self._execute(conn, insert)
+                                events.append(TaskAdded(task_id=task.id))
+
+                    if schedules:
+                        query = select(self._t_schedules.c.id).where(
+                            self._t_schedules.c.id.in_(schedule_ids)
+                        )
+                        result = await self._execute(conn, query)
+                        existing_schedule_ids = {row[0] for row in result}
+                        if (
+                            conflict_policy is ConflictPolicy.exception
+                            and existing_schedule_ids
+                        ):
+                            raise ConflictingIdError(sorted(existing_schedule_ids)[0])
+
+                        for schedule in schedules:
+                            values = self._convert_outgoing_fire_times(
+                                schedule.marshal(self.serializer)
+                            )
+                            if schedule.id in existing_schedule_ids:
+                                if conflict_policy is ConflictPolicy.do_nothing:
+                                    continue
+
+                                del values["id"]
+                                update = (
+                                    self._t_schedules.update()
+                                    .where(self._t_schedules.c.id == schedule.id)
+                                    .values(**values)
+                                )
+                                await self._execute(conn, update)
+                                events.append(
+                                    ScheduleUpdated(
+                                        schedule_id=schedule.id,
+                                        task_id=schedule.task_id,
+                                        next_fire_time=schedule.next_fire_time,
+                                    )
+                                )
+                            else:
+                                insert = self._t_schedules.insert().values(**values)
+                                await self._execute(conn, insert)
+                                events.append(
+                                    ScheduleAdded(
+                                        schedule_id=schedule.id,
+                                        task_id=schedule.task_id,
+                                        next_fire_time=schedule.next_fire_time,
+                                    )
+                                )
+
+        # Publish events only after the transaction has been committed
+        for event in events:
+            await self._event_broker.publish(event)
+
     async def remove_schedules(self, ids: Iterable[str]) -> None:
         async for attempt in self._retry():
             with attempt:

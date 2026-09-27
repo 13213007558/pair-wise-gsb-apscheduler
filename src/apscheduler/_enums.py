@@ -52,6 +52,28 @@ class RunState(Enum):
     stopped = auto()
 
 
+class SchedulerStopState(Enum):
+    """
+    Used to track the graceful stop progress of schedulers.
+
+    .. attribute:: requested
+
+        a stop was requested, but running jobs have not finished yet
+
+    .. attribute:: drained
+
+        all running jobs had already finished when the stop request was processed
+
+    .. attribute:: timed_out
+
+        the graceful stop window elapsed before all running jobs finished
+    """
+
+    requested = auto()
+    drained = auto()
+    timed_out = auto()
+
+
 class JobOutcome(Enum):
     """
     Used to indicate how the execution of a job ended.

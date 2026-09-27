@@ -177,8 +177,11 @@ class MemoryDataStore(BaseDataStore):
     ) -> None:
         # Send update events for schedules
         for result in results:
-            # Remove the schedule
             schedule = self._schedules_by_id[result.schedule_id]
+            if schedule.acquired_by != scheduler_id:
+                continue
+
+            # Remove the schedule
             index = self._find_schedule_index(schedule)
             del self._schedules[index]
 
@@ -263,6 +266,12 @@ class MemoryDataStore(BaseDataStore):
                 )
                 continue
 
+            # The slots occupied by leases expiring during this acquisition are
+            # accounted for by decrementing the counter above. Expired jobs which
+            # cannot start now are finalized below and must not leave that stale count.
+            if job.acquired_until is not None and job in job_results:
+                task.running_jobs += 1
+
             # Mark the job as acquired by this worker
             jobs.append(job)
             job.acquired_by = scheduler_id
@@ -283,18 +292,51 @@ class MemoryDataStore(BaseDataStore):
 
         # Discard the jobs that could not start
         for job, result in job_results.items():
-            await self.release_job(scheduler_id, job, result)
+            await self.release_job(
+                job.acquired_by or scheduler_id,
+                job,
+                result,
+                check_owner=False,
+                decrement_running_jobs=job.acquired_by is not None,
+            )
 
         return jobs
 
-    async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
+    async def release_job_claims(
+        self, scheduler_id: str, jobs: Iterable[Job]
+    ) -> None:
+        for job in jobs:
+            stored_job = self._jobs_by_id.get(job.id)
+            if stored_job is None or stored_job.acquired_by != scheduler_id:
+                continue
+
+            task = self._tasks[stored_job.task_id]
+            task.running_jobs -= 1
+            stored_job.acquired_by = None
+            stored_job.acquired_until = None
+
+    async def release_job(
+        self,
+        scheduler_id: str,
+        job: Job,
+        result: JobResult,
+        *,
+        check_owner: bool = True,
+        decrement_running_jobs: bool = True,
+    ) -> None:
+        stored_job = self._jobs_by_id.get(result.job_id)
+        if stored_job is None or (
+            check_owner and stored_job.acquired_by != scheduler_id
+        ):
+            return
+
         # Record the job result
         if result.expires_at > result.finished_at:
             self._job_results[result.job_id] = result
 
         # Decrement the number of running jobs for this task
-        if job.acquired_by:
-            self._tasks[job.task_id].running_jobs -= 1
+        if decrement_running_jobs and stored_job.acquired_by:
+            self._tasks[stored_job.task_id].running_jobs -= 1
 
         # Delete the job
         job = self._jobs_by_id.pop(result.job_id)
@@ -374,7 +416,12 @@ class MemoryDataStore(BaseDataStore):
                 job=job, outcome=JobOutcome.abandoned, finished_at=now
             )
             assert job.acquired_by is not None
-            await self.release_job(job.acquired_by, job, result)
+            await self.release_job(
+                job.acquired_by,
+                job,
+                result,
+                check_owner=False,
+            )
 
         # Release any schedules whose leases have expired
         for schedule in self._schedules:

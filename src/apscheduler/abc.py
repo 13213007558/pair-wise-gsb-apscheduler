@@ -333,13 +333,37 @@ class DataStore(metaclass=ABCMeta):
         """
 
     @abstractmethod
-    async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
+    async def release_job(
+        self,
+        scheduler_id: str,
+        job: Job,
+        result: JobResult,
+        *,
+        check_owner: bool = True,
+        decrement_running_jobs: bool = True,
+    ) -> None:
         """
         Release the claim on the given job and record the result.
 
         :param scheduler_id: unique identifier of the scheduler
         :param job: the job to be released
         :param result: the result of the job
+        """
+
+    @abstractmethod
+    async def release_job_claims(
+        self, scheduler_id: str, jobs: Iterable[Job]
+    ) -> None:
+        """
+        Return jobs acquired by the given scheduler to the pending queue.
+
+        This is used when a scheduler stops before starting jobs that were acquired in
+        the same acquisition batch. No job results or :class:`JobReleased` events are
+        produced. Implementations must only release jobs currently claimed by
+        ``scheduler_id``.
+
+        :param scheduler_id: unique identifier of the scheduler
+        :param jobs: the jobs whose claims should be released
         """
 
     @abstractmethod

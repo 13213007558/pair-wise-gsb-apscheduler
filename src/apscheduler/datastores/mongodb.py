@@ -756,6 +756,50 @@ class MongoDBDataStore(BaseExternalDataStore):
                     # Notify other schedulers
                     await self._event_broker.publish(event)
 
+    async def release_job_claims(
+        self, scheduler_id: str, jobs: Iterable[Job]
+    ) -> None:
+        job_ids = [job.id for job in jobs]
+        if not job_ids:
+            return
+
+        async for attempt in self._retry():
+            with attempt:
+                async with self._client.start_session() as session:
+                    cursor = self._jobs.find(
+                        {
+                            "acquired_by": scheduler_id,
+                            "_id": {"$in": job_ids},
+                        },
+                        projection=["task_id"],
+                        session=session,
+                    )
+                    task_counts: dict[str, int] = defaultdict(int)
+                    async for document in cursor:
+                        task_counts[document["task_id"]] += 1
+
+                    if task_counts:
+                        await self._jobs.update_many(
+                            {
+                                "acquired_by": scheduler_id,
+                                "_id": {"$in": job_ids},
+                            },
+                            {
+                                "$unset": {
+                                    "acquired_by": True,
+                                    "acquired_until": True,
+                                    "acquired_until_utcoffset": True,
+                                }
+                            },
+                            session=session,
+                        )
+                        for task_id, count in task_counts.items():
+                            await self._tasks.update_one(
+                                {"_id": task_id},
+                                {"$inc": {"running_jobs": -count}},
+                                session=session,
+                            )
+
     async def get_job_result(self, job_id: UUID) -> JobResult | None:
         async for attempt in self._retry():
             with attempt:

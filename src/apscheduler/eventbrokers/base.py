@@ -8,7 +8,12 @@ from logging import Logger
 from typing import Any
 
 import attrs
-from anyio import CapacityLimiter, create_task_group, to_thread
+from anyio import (
+    CapacityLimiter,
+    create_memory_object_stream,
+    create_task_group,
+    to_thread,
+)
 from anyio.abc import TaskGroup
 
 from .. import _events
@@ -40,11 +45,20 @@ class BaseEventBroker(EventBroker):
     )
     _task_group: TaskGroup = attrs.field(init=False)
     _thread_limiter: CapacityLimiter = attrs.field(init=False)
+    _delivery_stream: Any = attrs.field(init=False, default=None)
 
     async def start(self, exit_stack: AsyncExitStack, logger: Logger) -> None:
         self._logger = logger
+        send, receive = create_memory_object_stream(
+            float("inf"),
+            item_type=tuple[LocalSubscription, Event],
+        )
+        self._delivery_stream = (send, receive)
+        exit_stack.callback(setattr, self, "_delivery_stream", None)
+        exit_stack.push_async_callback(send.aclose)
         self._task_group = await exit_stack.enter_async_context(create_task_group())
         self._thread_limiter = CapacityLimiter(1)
+        self._task_group.start_soon(self._run_delivery_loop, name="Event delivery loop")
 
     def subscribe(
         self,
@@ -67,18 +81,43 @@ class BaseEventBroker(EventBroker):
 
     async def publish_local(self, event: Event) -> None:
         event_type = type(event)
+        events: list[tuple[LocalSubscription, Event]] = []
         one_shot_tokens: list[object] = []
         for subscription in self._subscriptions.values():
             if (
                 subscription.event_types is None
                 or event_type in subscription.event_types
             ):
-                self._task_group.start_soon(self._deliver_event, subscription, event)
+                events.append((subscription, event))
                 if subscription.one_shot:
                     one_shot_tokens.append(subscription.token)
 
         for token in one_shot_tokens:
             self.unsubscribe(token)
+
+        for subscription, delivered_event in events:
+            if subscription.is_async:
+                try:
+                    retval = subscription.callback(delivered_event)
+                    if iscoroutine(retval):
+                        await retval
+                except Exception:
+                    self._logger.exception(
+                        "Error delivering %s event", event.__class__.__name__
+                    )
+            else:
+                self._delivery_stream[0].send_nowait((subscription, event))
+
+    async def _run_delivery_loop(self) -> None:
+        send, receive = self._delivery_stream
+        async with create_task_group() as delivery_task_group:
+            async def deliver_events() -> None:
+                async for subscription, event in receive:
+                    delivery_task_group.start_soon(
+                        self._deliver_event, subscription, event
+                    )
+
+            delivery_task_group.start_soon(deliver_events)
 
     async def _deliver_event(
         self, subscription: LocalSubscription, event: Event

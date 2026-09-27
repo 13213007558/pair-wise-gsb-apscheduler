@@ -5,7 +5,7 @@ import platform
 import random
 import sys
 from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from inspect import isbuiltin, isclass, ismethod, ismodule
@@ -31,12 +31,22 @@ from .. import JobAdded, SerializationError, TaskLookupError
 from .._context import current_async_scheduler, current_job
 from .._converters import as_enum, as_timedelta
 from .._decorators import TaskParameters, get_task_params
-from .._enums import CoalescePolicy, ConflictPolicy, JobOutcome, RunState, SchedulerRole
+from .._enums import (
+    CoalescePolicy,
+    ConflictPolicy,
+    JobOutcome,
+    RunState,
+    SchedulerRole,
+    SchedulerStopState,
+)
 from .._events import (
     Event,
     JobReleased,
     ScheduleAdded,
+    SchedulerDrainComplete,
     SchedulerStarted,
+    SchedulerStopRequested,
+    SchedulerStopTimedOut,
     SchedulerStopped,
     ScheduleUpdated,
     T_Event,
@@ -105,6 +115,9 @@ class AsyncScheduler:
         calls to :meth:`cleanup` – ``None`` to disable automatic clean-up
     :param lease_duration: maximum amount of time (as seconds or timedelta) that
         the scheduler can keep a lock on a schedule or task
+    :param graceful_shutdown_timeout: maximum amount of time (as seconds or timedelta)
+        to wait for running jobs to finish after :meth:`stop`; ``None`` waits forever,
+        ``0`` cancels them immediately (the compatible default)
     :param logger: the logger instance used to log events from the scheduler, data store
         and event broker
     """
@@ -133,6 +146,12 @@ class AsyncScheduler:
         default=timedelta(minutes=15),
     )
     lease_duration: timedelta = attrs.field(converter=as_timedelta, default=30)
+    graceful_shutdown_timeout: timedelta | None = attrs.field(
+        kw_only=True,
+        converter=as_timedelta,
+        validator=optional(instance_of(timedelta)),
+        default=_zero_timedelta,
+    )
     logger: Logger = attrs.field(kw_only=True, default=getLogger(__name__))
 
     _state: RunState = attrs.field(init=False, default=RunState.stopped)
@@ -141,6 +160,12 @@ class AsyncScheduler:
     _services_initialized: bool = attrs.field(init=False, default=False)
     _scheduler_cancel_scope: CancelScope | None = attrs.field(init=False, default=None)
     _running_jobs: set[Job] = attrs.field(init=False, factory=set)
+    _job_cancel_scopes: dict[UUID, CancelScope] = attrs.field(init=False, factory=dict)
+    _stop_event: anyio.Event = attrs.field(init=False, factory=anyio.Event)
+    _jobs_drained_event: anyio.Event = attrs.field(init=False, factory=anyio.Event)
+    _stop_state: SchedulerStopState | None = attrs.field(init=False, default=None)
+    _pending_claim_operations: int = attrs.field(init=False, default=0)
+    _claim_operations_lock: anyio.Lock = attrs.field(init=False, factory=anyio.Lock)
     _task_callables: dict[str, Callable] = attrs.field(init=False, factory=dict)
 
     def __attrs_post_init__(self) -> None:
@@ -218,17 +243,55 @@ class AsyncScheduler:
         assert delay > 0
         while self._state in (RunState.starting, RunState.started):
             await self.cleanup()
-            await sleep(delay)
+            async with self._cancel_on_stop():
+                await sleep(delay)
 
     @property
     def state(self) -> RunState:
         """The current running state of the scheduler."""
         return self._state
 
+    @property
+    def stop_state(self) -> SchedulerStopState | None:
+        """The current graceful stop state, or ``None`` while running."""
+        return self._stop_state
+
+    @asynccontextmanager
+    async def _cancel_on_stop(self):
+        async with create_task_group() as task_group:
+            async def wait_for_stop() -> None:
+                await self._stop_event.wait()
+                task_group.cancel_scope.cancel()
+
+            task_group.start_soon(wait_for_stop)
+            try:
+                yield
+            finally:
+                task_group.cancel_scope.cancel()
+
     async def cleanup(self) -> None:
         """Clean up expired job results and finished schedules."""
         await self.data_store.cleanup()
         self.logger.info("Cleaned up expired job results and finished schedules")
+
+    @asynccontextmanager
+    async def _claim_operation(self):
+        async with self._claim_operations_lock:
+            self._pending_claim_operations += 1
+
+        try:
+            yield
+        finally:
+            async with self._claim_operations_lock:
+                self._pending_claim_operations -= 1
+
+    async def _wait_for_claim_operations(self) -> None:
+        while True:
+            async with self._claim_operations_lock:
+                if self._pending_claim_operations == 0:
+                    return
+
+            await sleep(0)
 
     @overload
     def subscribe(
@@ -819,15 +882,24 @@ class AsyncScheduler:
 
     async def stop(self) -> None:
         """
-        Signal the scheduler that it should stop processing schedules.
+        Signal the scheduler that it should stop processing schedules and jobs.
 
-        This method does not wait for the scheduler to actually stop.
-        For that, see :meth:`wait_until_stopped`.
+        New claims are rejected immediately. Jobs already running are allowed to finish
+        for up to ``graceful_shutdown_timeout``; ``None`` waits indefinitely and ``0``
+        preserves the previous immediate cancellation behavior. This method does not
+        wait for the scheduler to actually stop. For that, see
+        :meth:`wait_until_stopped`.
 
         """
-        if self._state is RunState.started and self._scheduler_cancel_scope:
+        if self._state in (RunState.started, RunState.starting):
             self._state = RunState.stopping
-            self._scheduler_cancel_scope.cancel()
+            self._stop_state = SchedulerStopState.requested
+            self._stop_event.set()
+            with CancelScope(shield=True):
+                await self.event_broker.publish_local(SchedulerStopRequested())
+            if not self._running_jobs:
+                self._jobs_drained_event.set()
+                self._stop_state = SchedulerStopState.drained
 
     async def wait_until_stopped(self) -> None:
         """
@@ -858,6 +930,10 @@ class AsyncScheduler:
                 f'Cannot start the scheduler when it is in the "{self._state}" state'
             )
 
+        self._stop_event = anyio.Event()
+        self._jobs_drained_event = anyio.Event()
+        self._pending_claim_operations = 0
+        self._stop_state = None
         self._state = RunState.starting
         async with AsyncExitStack() as exit_stack:
             await self._ensure_services_initialized(exit_stack)
@@ -871,7 +947,6 @@ class AsyncScheduler:
                 async with create_task_group() as task_group:
                     self._scheduler_cancel_scope = task_group.cancel_scope
                     exit_stack.callback(setattr, self, "_scheduler_cancel_scope", None)
-
                     # Start periodic cleanups
                     if self.cleanup_interval:
                         task_group.start_soon(
@@ -882,6 +957,12 @@ class AsyncScheduler:
                             "Started internal cleanup loop with interval: %s",
                             self.cleanup_interval,
                         )
+
+                    self._state = RunState.started
+                    task_group.start_soon(
+                        self._stop_scheduler,
+                        name=f"Scheduler {self.identity!r} stop controller",
+                    )
 
                     # Start processing due schedules, if configured to do so
                     if self.role in (SchedulerRole.scheduler, SchedulerRole.both):
@@ -898,7 +979,6 @@ class AsyncScheduler:
                         )
 
                     # Signal that the scheduler has started
-                    self._state = RunState.started
                     self.logger.info("Scheduler started")
                     task_status.started()
                     await self.event_broker.publish_local(SchedulerStarted())
@@ -922,6 +1002,37 @@ class AsyncScheduler:
                         SchedulerStopped(exception=exception)
                     )
 
+    async def _stop_scheduler(self) -> None:
+        while self._state is RunState.starting:
+            await sleep(0)
+
+        await self._stop_event.wait()
+        await self._wait_for_claim_operations()
+
+        timeout: float | None
+        if self.graceful_shutdown_timeout is None:
+            timeout = None
+        else:
+            timeout = self.graceful_shutdown_timeout.total_seconds()
+
+        timed_out = False
+        with move_on_after(timeout):
+            await self._jobs_drained_event.wait()
+            timed_out = self._stop_state is SchedulerStopState.timed_out
+
+        if self._stop_state is SchedulerStopState.drained and not timed_out:
+            with CancelScope(shield=True):
+                await self.event_broker.publish_local(SchedulerDrainComplete())
+        else:
+            self._stop_state = SchedulerStopState.timed_out
+            with CancelScope(shield=True):
+                await self.event_broker.publish_local(SchedulerStopTimedOut())
+                for scope in self._job_cancel_scopes.values():
+                    scope.cancel()
+
+        assert self._scheduler_cancel_scope is not None
+        self._scheduler_cancel_scope.cancel()
+
     async def _process_schedules(self, *, task_status: TaskStatus[None]) -> None:
         wakeup_event = anyio.Event()
         wakeup_deadline: datetime | None = None
@@ -940,11 +1051,13 @@ class AsyncScheduler:
 
         async def extend_schedule_leases(schedules: Sequence[Schedule]) -> None:
             schedule_ids = {schedule.id for schedule in schedules}
-            while True:
-                await sleep(self.lease_duration.total_seconds() / 2)
-                await self.data_store.extend_acquired_schedule_leases(
-                    self.identity, schedule_ids, self.lease_duration
-                )
+            while self._state is RunState.started:
+                async with self._cancel_on_stop():
+                    await sleep(self.lease_duration.total_seconds() / 2)
+                if self._state is RunState.started:
+                    await self.data_store.extend_acquired_schedule_leases(
+                        self.identity, schedule_ids, self.lease_duration
+                    )
 
         subscription = self.event_broker.subscribe(
             schedule_added_or_modified, {ScheduleAdded, ScheduleUpdated}
@@ -955,9 +1068,11 @@ class AsyncScheduler:
             await self.get_next_event(SchedulerStarted)
 
             while self._state is RunState.started:
-                schedules = await self.data_store.acquire_schedules(
-                    self.identity, self.lease_duration, 100
-                )
+                async with self._claim_operation():
+                    with CancelScope(shield=True):
+                        schedules = await self.data_store.acquire_schedules(
+                            self.identity, self.lease_duration, 100
+                        )
                 async with AsyncExitStack() as exit_stack:
                     tg = await exit_stack.enter_async_context(create_task_group())
                     tg.start_soon(
@@ -972,6 +1087,9 @@ class AsyncScheduler:
                     now = datetime.now(timezone.utc)
                     results: list[ScheduleResult] = []
                     for schedule in schedules:
+                        if self._state is not RunState.started:
+                            break
+
                         # Calculate a next fire time for the schedule, if possible
                         fire_times = [schedule.next_fire_time]
                         calculate_next = schedule.trigger.next
@@ -1005,6 +1123,8 @@ class AsyncScheduler:
                             else 0
                         )
                         for i, fire_time in enumerate(fire_times):
+                            if self._state is not RunState.started:
+                                break
                             # Calculate a jitter if max_jitter > 0
                             jitter = _zero_timedelta
                             if max_jitter:
@@ -1049,17 +1169,29 @@ class AsyncScheduler:
                                 result_expiration_time=schedule.job_result_expiration_time,
                                 metadata=schedule.metadata.copy(),
                             )
-                            await self.data_store.add_job(job)
+                            if self._state is RunState.started:
+                                await self.data_store.add_job(job)
 
-                        results.append(
-                            ScheduleResult(
-                                schedule_id=schedule.id,
-                                task_id=schedule.task_id,
-                                trigger=schedule.trigger,
-                                last_fire_time=fire_times[-1],
-                                next_fire_time=next_fire_time,
+                        if self._state is RunState.started:
+                            results.append(
+                                ScheduleResult(
+                                    schedule_id=schedule.id,
+                                    task_id=schedule.task_id,
+                                    trigger=schedule.trigger,
+                                    last_fire_time=fire_times[-1],
+                                    next_fire_time=next_fire_time,
+                                )
                             )
-                        )
+                        else:
+                            results.append(
+                                ScheduleResult(
+                                    schedule_id=schedule.id,
+                                    task_id=schedule.task_id,
+                                    trigger=schedule.trigger,
+                                    last_fire_time=schedule.last_fire_time,
+                                    next_fire_time=schedule.next_fire_time,
+                                )
+                            )
 
                 # Update the schedules (and release the scheduler's claim on them)
                 await self.data_store.release_schedules(self.identity, results)
@@ -1082,9 +1214,10 @@ class AsyncScheduler:
                     else:
                         self.logger.debug("Waiting for any due schedules to appear")
 
-                    with move_on_after(wait_time):
-                        await wakeup_event.wait()
-                        wakeup_event = anyio.Event()
+                    async with self._cancel_on_stop():
+                        with move_on_after(wait_time):
+                            await wakeup_event.wait()
+                            wakeup_event = anyio.Event()
                 else:
                     self.logger.debug("Processing more schedules on the next iteration")
 
@@ -1118,8 +1251,13 @@ class AsyncScheduler:
                 wakeup_event.set()
 
         async def extend_job_leases() -> None:
-            while self._state in (RunState.starting, RunState.started):
-                await sleep(self.lease_duration.total_seconds() / 2)
+            while self._state in (
+                RunState.starting,
+                RunState.started,
+                RunState.stopping,
+            ):
+                async with self._cancel_on_stop():
+                    await sleep(self.lease_duration.total_seconds() / 2)
                 if job_ids := {job.id for job in self._running_jobs}:
                     await self.data_store.extend_acquired_job_leases(
                         self.identity, job_ids, self.lease_duration
@@ -1154,80 +1292,124 @@ class AsyncScheduler:
             while self._state is RunState.started:
                 limit = self.max_concurrent_jobs - len(self._running_jobs)
                 if limit > 0:
-                    jobs = await self.data_store.acquire_jobs(
-                        self.identity, self.lease_duration, limit
-                    )
-                    for job in jobs:
-                        task = await self.data_store.get_task(job.task_id)
-                        func = self._get_task_callable(task)
-                        self._running_jobs.add(job)
-                        task_group.start_soon(
-                            self._run_job,
-                            job,
-                            func,
-                            job.executor,
-                            name=(
-                                f"Scheduler {self.identity!r} job {job.id} "
-                                f"({job.executor!r})"
-                            ),
-                        )
+                    async with self._claim_operation():
+                        with CancelScope(shield=True):
+                            jobs = await self.data_store.acquire_jobs(
+                                self.identity, self.lease_duration, limit
+                            )
+                    stopped_jobs: list[Job] = []
+                    with CancelScope(shield=True):
+                        if self._state is not RunState.started:
+                            stopped_jobs = jobs
+                            jobs = []
 
-                await wakeup_event.wait()
-                wakeup_event = anyio.Event()
+                        for job in jobs:
+                            try:
+                                task = await self.data_store.get_task(job.task_id)
+                                func = self._get_task_callable(task)
+                                cancel_scope = CancelScope()
+                                self._running_jobs.add(job)
+                                self._job_cancel_scopes[job.id] = cancel_scope
+                                task_group.start_soon(
+                                    self._run_job,
+                                    job,
+                                    func,
+                                    job.executor,
+                                    cancel_scope,
+                                    name=(
+                                        f"Scheduler {self.identity!r} job {job.id} "
+                                        f"({job.executor!r})"
+                                    ),
+                                )
+                            except BaseException:
+                                if job in self._running_jobs:
+                                    self._running_jobs.remove(job)
+                                self._job_cancel_scopes.pop(job.id, None)
+                                raise
 
-    async def _run_job(self, job: Job, func: Callable[..., Any], executor: str) -> None:
+                        if stopped_jobs:
+                            await self.data_store.release_job_claims(
+                                self.identity, stopped_jobs
+                            )
+
+                async with self._cancel_on_stop():
+                    await wakeup_event.wait()
+                    wakeup_event = anyio.Event()
+
+    async def _run_job(
+        self,
+        job: Job,
+        func: Callable[..., Any],
+        executor: str,
+        cancel_scope: CancelScope,
+    ) -> None:
         try:
-            # Check if the job started before the deadline
-            start_time = datetime.now(timezone.utc)
-            if job.start_deadline is not None and start_time > job.start_deadline:
-                result = JobResult.from_job(
-                    job, JobOutcome.missed_start_deadline, finished_at=start_time
-                )
-                await self.data_store.release_job(self.identity, job, result)
-                return
-
-            try:
-                job_executor = self.job_executors[executor]
-            except KeyError:
-                return
-
-            token = current_job.set(job)
-            try:
-                retval = await job_executor.run_job(func, job)
-            except get_cancelled_exc_class():
-                self.logger.info("Job %s was cancelled", job.id)
-                with CancelScope(shield=True):
+            with cancel_scope:
+                start_time = datetime.now(timezone.utc)
+                if job.start_deadline is not None and start_time > job.start_deadline:
                     result = JobResult.from_job(
-                        job, JobOutcome.cancelled, started_at=start_time
+                        job, JobOutcome.missed_start_deadline, finished_at=start_time
                     )
                     await self.data_store.release_job(self.identity, job, result)
-            except BaseException as exc:
-                if isinstance(exc, Exception):
-                    self.logger.exception("Job %s raised an exception", job.id)
-                else:
-                    self.logger.error(
-                        "Job %s was aborted due to %s", job.id, exc.__class__.__name__
-                    )
+                    return
 
-                result = JobResult.from_job(
-                    job,
-                    JobOutcome.error,
-                    started_at=start_time,
-                    exception=exc,
-                )
-                await self.data_store.release_job(self.identity, job, result)
-                if not isinstance(exc, Exception):
-                    raise
-            else:
-                self.logger.info("Job %s completed successfully", job.id)
-                result = JobResult.from_job(
-                    job,
-                    JobOutcome.success,
-                    started_at=start_time,
-                    return_value=retval,
-                )
-                await self.data_store.release_job(self.identity, job, result)
-            finally:
-                current_job.reset(token)
+                try:
+                    job_executor = self.job_executors[executor]
+                except KeyError:
+                    result = JobResult.from_job(
+                        job, JobOutcome.error, started_at=start_time
+                    )
+                    await self.data_store.release_job(self.identity, job, result)
+                    return
+
+                token = current_job.set(job)
+                try:
+                    retval = await job_executor.run_job(func, job)
+                except get_cancelled_exc_class():
+                    self.logger.info("Job %s was cancelled", job.id)
+                    with CancelScope(shield=True):
+                        result = JobResult.from_job(
+                            job, JobOutcome.cancelled, started_at=start_time
+                        )
+                        await self.data_store.release_job(self.identity, job, result)
+                except BaseException as exc:
+                    if isinstance(exc, Exception):
+                        self.logger.exception("Job %s raised an exception", job.id)
+                    else:
+                        self.logger.error(
+                            "Job %s was aborted due to %s",
+                            job.id,
+                            exc.__class__.__name__,
+                        )
+
+                    result = JobResult.from_job(
+                        job,
+                        JobOutcome.error,
+                        started_at=start_time,
+                        exception=exc,
+                    )
+                    await self.data_store.release_job(self.identity, job, result)
+                    if not isinstance(exc, Exception):
+                        raise
+                else:
+                    self.logger.info("Job %s completed successfully", job.id)
+                    result = JobResult.from_job(
+                        job,
+                        JobOutcome.success,
+                        started_at=start_time,
+                        return_value=retval,
+                    )
+                    await self.data_store.release_job(self.identity, job, result)
+                finally:
+                    current_job.reset(token)
         finally:
-            self._running_jobs.remove(job)
+            with CancelScope(shield=True):
+                self._running_jobs.remove(job)
+                self._job_cancel_scopes.pop(job.id, None)
+                if not self._running_jobs:
+                    self._jobs_drained_event.set()
+                    if (
+                        self._state is RunState.stopping
+                        and self._stop_state is not SchedulerStopState.timed_out
+                    ):
+                        self._stop_state = SchedulerStopState.drained

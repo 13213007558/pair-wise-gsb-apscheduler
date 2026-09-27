@@ -11,6 +11,7 @@ from ._enums import ConflictPolicy as ConflictPolicy
 from ._enums import JobOutcome as JobOutcome
 from ._enums import RunState as RunState
 from ._enums import SchedulerRole as SchedulerRole
+from ._enums import SchedulerStopState as SchedulerStopState
 from ._events import DataStoreEvent as DataStoreEvent
 from ._events import Event as Event
 from ._events import JobAcquired as JobAcquired
@@ -23,6 +24,9 @@ from ._events import ScheduleDeserializationFailed as ScheduleDeserializationFai
 from ._events import ScheduleRemoved as ScheduleRemoved
 from ._events import SchedulerEvent as SchedulerEvent
 from ._events import SchedulerStarted as SchedulerStarted
+from ._events import SchedulerDrainComplete as SchedulerDrainComplete
+from ._events import SchedulerStopRequested as SchedulerStopRequested
+from ._events import SchedulerStopTimedOut as SchedulerStopTimedOut
 from ._events import SchedulerStopped as SchedulerStopped
 from ._events import ScheduleUpdated as ScheduleUpdated
 from ._events import TaskAdded as TaskAdded

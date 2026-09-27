@@ -10,7 +10,7 @@ import attrs
 from attrs.converters import optional
 
 from ._converters import as_aware_datetime, as_enum, as_uuid
-from ._enums import JobOutcome
+from ._enums import JobOutcome, SchedulerStopState
 from ._structures import Job, JobResult
 from ._utils import qualified_name
 
@@ -205,6 +205,26 @@ class SchedulerStopped(SchedulerEvent):
     """
 
     exception: BaseException | None = None
+
+
+@attrs.define(kw_only=True, frozen=True)
+class SchedulerStopRequested(SchedulerEvent):
+    """Signals that a scheduler received a stop request."""
+
+
+@attrs.define(kw_only=True, frozen=True)
+class SchedulerDrainComplete(SchedulerEvent):
+    """Signals that all jobs running when stop was requested have finished."""
+
+
+@attrs.define(kw_only=True, frozen=True)
+class SchedulerStopTimedOut(SchedulerEvent):
+    """Signals that the graceful stop window elapsed and remaining jobs were cancelled."""
+
+    stop_state: SchedulerStopState = attrs.field(
+        default=SchedulerStopState.timed_out,
+        converter=as_enum(SchedulerStopState),
+    )
 
 
 @attrs.define(kw_only=True, frozen=True)

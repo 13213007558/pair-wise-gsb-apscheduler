@@ -12,7 +12,7 @@ from functools import partial
 from inspect import signature
 from queue import Queue
 from types import ModuleType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
 import anyio
@@ -45,6 +45,10 @@ from apscheduler import (
     Scheduler,
     ScheduleRemoved,
     SchedulerRole,
+    SchedulerDrainComplete,
+    SchedulerStopRequested,
+    SchedulerStopState,
+    SchedulerStopTimedOut,
     SchedulerStarted,
     SchedulerStopped,
     ScheduleUpdated,
@@ -73,6 +77,9 @@ else:
     from exceptiongroup import ExceptionGroup
 
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from time_machine import TimeMachineFixture
 
 pytestmark = pytest.mark.anyio
 
@@ -308,11 +315,11 @@ class TestAsyncScheduler:
     async def test_add_job_wait_result(self, raw_datastore: DataStore) -> None:
         send, receive = create_memory_object_stream[Event](2)
         async with AsyncExitStack() as exit_stack:
-            exit_stack.enter_context(send)
-            exit_stack.enter_context(receive)
             scheduler = await exit_stack.enter_async_context(
                 AsyncScheduler(data_store=raw_datastore)
             )
+            exit_stack.enter_context(send)
+            exit_stack.enter_context(receive)
             assert await scheduler.get_jobs() == []
 
             scheduler.subscribe(send.send)
@@ -1203,6 +1210,207 @@ class TestAsyncScheduler:
             # Check that the job outcome was set to "cancelled"
             result = await scheduler.get_job_result(job_id)
             assert result.outcome is JobOutcome.cancelled
+
+    async def test_graceful_stop_waits_for_running_job_and_extends_lease(
+        self, time_machine: TimeMachineFixture
+    ) -> None:
+        time_machine.move_to(datetime.now(timezone.utc), tick=True)
+        data_store = MemoryDataStore()
+        ready = anyio.Event()
+        finish = anyio.Event()
+        events: list[Event] = []
+        stopped = anyio.Event()
+
+        async def graceful_job() -> None:
+            ready.set()
+            await finish.wait()
+
+        async with AsyncScheduler(
+            data_store=data_store,
+            graceful_shutdown_timeout=2,
+            lease_duration=timedelta(milliseconds=40),
+        ) as scheduler:
+            scheduler.subscribe(lambda _: stopped.set(), SchedulerStopped, one_shot=True)
+            with scheduler.subscribe(
+                events.append,
+                {
+                    SchedulerStopRequested,
+                    SchedulerDrainComplete,
+                    SchedulerStopTimedOut,
+                    SchedulerStopped,
+                },
+            ):
+                await scheduler.configure_task("graceful", func=graceful_job)
+                job_id = await scheduler.add_job(
+                    "graceful", result_expiration_time=timedelta(minutes=1)
+                )
+                await scheduler.start_in_background()
+                with fail_after(2):
+                    await ready.wait()
+
+                await scheduler.stop()
+                acquired_until = (await data_store.get_jobs([job_id]))[0].acquired_until
+                time_machine.shift(1)
+                with fail_after(2):
+                    while (
+                        await data_store.get_jobs([job_id])
+                    )[0].acquired_until == acquired_until:
+                        await sleep(0.01)
+
+                finish.set()
+                with fail_after(2):
+                    await stopped.wait()
+
+            assert scheduler.state is RunState.stopped
+            assert scheduler.stop_state is SchedulerStopState.drained
+            assert [type(event) for event in events] == [
+                SchedulerStopRequested,
+                SchedulerDrainComplete,
+                SchedulerStopped,
+            ]
+            assert not scheduler._running_jobs
+            assert not await scheduler.get_jobs()
+            assert (await scheduler.get_tasks())[0].running_jobs == 0
+            result = await scheduler.get_job_result(job_id)
+            assert result.outcome is JobOutcome.success
+
+    async def test_graceful_stop_timeout_cancels_job(self) -> None:
+        ready = anyio.Event()
+        events: list[Event] = []
+        stopped = anyio.Event()
+
+        async def slow_job() -> None:
+            ready.set()
+            await sleep(10)
+
+        async with AsyncScheduler(
+            graceful_shutdown_timeout=timedelta(milliseconds=20),
+        ) as scheduler:
+            scheduler.subscribe(lambda _: stopped.set(), SchedulerStopped, one_shot=True)
+            with scheduler.subscribe(
+                events.append,
+                {
+                    SchedulerStopRequested,
+                    SchedulerDrainComplete,
+                    SchedulerStopTimedOut,
+                    SchedulerStopped,
+                },
+            ):
+                await scheduler.configure_task("slow", func=slow_job)
+                job_id = await scheduler.add_job("slow", result_expiration_time=10)
+                await scheduler.start_in_background()
+                with fail_after(2):
+                    await ready.wait()
+
+                await scheduler.stop()
+                with fail_after(2):
+                    await stopped.wait()
+
+            assert scheduler.state is RunState.stopped
+            assert scheduler.stop_state is SchedulerStopState.timed_out
+            assert [type(event) for event in events] == [
+                SchedulerStopRequested,
+                SchedulerStopTimedOut,
+                SchedulerStopped,
+            ]
+            assert not scheduler._running_jobs
+            assert not await scheduler.get_jobs()
+            assert (await scheduler.get_tasks())[0].running_jobs == 0
+            result = await scheduler.get_job_result(job_id)
+            assert result.outcome is JobOutcome.cancelled
+
+    async def test_repeated_stop_emits_request_once(self) -> None:
+        ready = anyio.Event()
+        finish = anyio.Event()
+        events: list[Event] = []
+        stopped = anyio.Event()
+
+        async def slow_job() -> None:
+            ready.set()
+            await finish.wait()
+
+        async with AsyncScheduler(graceful_shutdown_timeout=5) as scheduler:
+            scheduler.subscribe(lambda _: stopped.set(), SchedulerStopped, one_shot=True)
+            with scheduler.subscribe(
+                events.append,
+                {SchedulerStopRequested, SchedulerDrainComplete},
+            ):
+                await scheduler.configure_task("slow", func=slow_job)
+                await scheduler.add_job("slow")
+                await scheduler.start_in_background()
+                with fail_after(2):
+                    await ready.wait()
+
+                await scheduler.stop()
+                await scheduler.stop()
+                assert scheduler.state is RunState.stopping
+                assert scheduler.stop_state is SchedulerStopState.requested
+                finish.set()
+                with fail_after(2):
+                    await stopped.wait()
+
+            assert [type(event) for event in events] == [
+                SchedulerStopRequested,
+                SchedulerDrainComplete,
+            ]
+
+    async def test_stop_during_acquisition_returns_job_to_queue(self) -> None:
+        data_store = MemoryDataStore()
+        original_acquire_jobs = data_store.acquire_jobs
+        acquisition_started = anyio.Event()
+        allow_acquisition = anyio.Event()
+        stopped = anyio.Event()
+
+        async def barrier_acquire_jobs(*args, **kwargs):
+            acquisition_started.set()
+            await allow_acquisition.wait()
+            jobs = await original_acquire_jobs(*args, **kwargs)
+            await scheduler.stop()
+            return jobs
+
+        data_store.acquire_jobs = barrier_acquire_jobs
+        acquired_events: list[Event] = []
+
+        async def queued_job() -> None:
+            pass
+
+        async with AsyncScheduler(data_store=data_store) as scheduler:
+            scheduler.subscribe(lambda _: stopped.set(), SchedulerStopped, one_shot=True)
+            await scheduler.configure_task("queued", func=queued_job)
+            job_id = await scheduler.add_job("queued")
+            with scheduler.subscribe(acquired_events.append, JobAcquired):
+                await scheduler.start_in_background()
+                with fail_after(2):
+                    await acquisition_started.wait()
+                allow_acquisition.set()
+                with fail_after(2):
+                    await stopped.wait()
+
+            jobs = await data_store.get_jobs([job_id])
+            assert len(jobs) == 1
+            assert jobs[0].acquired_by is None
+            assert jobs[0].acquired_until is None
+            assert (await data_store.get_task("queued")).running_jobs == 0
+            assert len(acquired_events) == 1
+            data_store.acquire_jobs = original_acquire_jobs
+
+            released = anyio.Event()
+            scheduler.subscribe(
+                lambda event: released.set()
+                if event.job_id == job_id
+                else None,
+                JobReleased,
+                one_shot=True,
+            )
+            await scheduler.start_in_background()
+            with fail_after(2):
+                await released.wait()
+            with fail_after(2):
+                await scheduler.stop()
+                await stopped.wait()
+
+            assert not await scheduler.get_jobs()
+            assert (await scheduler.get_tasks())[0].running_jobs == 0
 
 
 class TestSyncScheduler:

@@ -20,6 +20,7 @@ from apscheduler import (
     DeserializationError,
     Event,
     Job,
+    JobReleased,
     JobOutcome,
     JobResult,
     Schedule,
@@ -563,6 +564,54 @@ async def test_job_release_cancelled(datastore: DataStore) -> None:
     assert not await datastore.get_job_result(acquired[0].id)
 
 
+async def test_release_job_claims(datastore: DataStore) -> None:
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+    acquired = await datastore.acquire_jobs("worker1", timedelta(seconds=30), 1)
+    await datastore.release_job_claims("worker2", acquired)
+
+    stored_jobs = await datastore.get_jobs({job.id})
+    assert stored_jobs == acquired
+    assert (await datastore.get_task("task1")).running_jobs == 1
+
+    await datastore.release_job_claims("worker1", acquired)
+    stored_jobs = await datastore.get_jobs({job.id})
+    assert len(stored_jobs) == 1
+    assert stored_jobs[0].acquired_by is None
+    assert stored_jobs[0].acquired_until is None
+    assert (await datastore.get_task("task1")).running_jobs == 0
+    assert await datastore.get_job_result(job.id) is None
+
+
+async def test_release_job_does_not_release_other_owner(datastore: DataStore) -> None:
+    events = []
+    datastore._event_broker.subscribe(events.append, {JobReleased})
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+    await datastore.acquire_jobs("worker1", timedelta(seconds=30), 1)
+    stored_job = (await datastore.get_jobs({job.id}))[0]
+
+    await datastore.release_job(
+        "worker2",
+        stored_job,
+        JobResult.from_job(stored_job, JobOutcome.cancelled),
+    )
+
+    assert len(await datastore.get_jobs({job.id})) == 1
+    assert (await datastore.get_task("task1")).running_jobs == 1
+    assert not events
+
+
 @pytest.mark.skipif(
     platform.python_implementation() != "CPython",
     reason="time-machine is not available",
@@ -599,6 +648,36 @@ async def test_acquire_jobs_lock_timeout(
     acquired = await datastore.acquire_jobs("worker2", timedelta(seconds=30), 1)
     assert len(acquired) == 1
     assert acquired[0].id == job.id
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_acquire_expired_job_fixes_stale_running_count(
+    datastore: DataStore, time_machine: TimeMachineFixture
+) -> None:
+    await datastore.add_task(
+        Task(
+            id="task1",
+            func="contextlib:asynccontextmanager",
+            job_executor="async",
+            max_running_jobs=1,
+        )
+    )
+    job = Job(task_id="task1", executor="async")
+    await datastore.add_job(job)
+
+    time_machine.move_to(datetime.now(timezone.utc), tick=False)
+    assert await datastore.acquire_jobs("worker1", timedelta(seconds=30), 1)
+    assert (await datastore.get_task("task1")).running_jobs == 1
+
+    time_machine.shift(31)
+    acquired = await datastore.acquire_jobs("worker2", timedelta(seconds=30), 1)
+    assert len(acquired) == 1
+    assert acquired[0].acquired_by == "worker2"
+    assert (await datastore.get_task("task1")).running_jobs == 1
+    assert not await datastore.acquire_jobs("worker3", timedelta(seconds=30), 1)
 
 
 async def test_acquire_jobs_max_number_exceeded(datastore: DataStore) -> None:

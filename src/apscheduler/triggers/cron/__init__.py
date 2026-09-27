@@ -16,6 +16,7 @@ from apscheduler.util import (
     convert_to_datetime,
     datetime_ceil,
     datetime_repr,
+    timezone_repr,
 )
 
 
@@ -37,6 +38,10 @@ class CronTrigger(BaseTrigger):
     :param datetime.tzinfo|str timezone: time zone to use for the date/time calculations (defaults
         to scheduler timezone)
     :param int|None jitter: delay the job execution by ``jitter`` seconds at most
+    :param str dst_policy: controls how wall-clock times that are skipped (``gap``) or repeated
+        (``fold``) by daylight saving time transitions are handled. ``skip`` skips the nominal
+        time, ``first`` uses the earlier concrete time, ``next_valid`` uses the later concrete
+        time and ``both`` returns both concrete times. The default is ``first``.
 
     .. note:: The first weekday is always **monday**.
     """
@@ -62,7 +67,16 @@ class CronTrigger(BaseTrigger):
         "second": BaseField,
     }
 
-    __slots__ = "timezone", "start_date", "end_date", "fields", "jitter"
+    __slots__ = (
+        "timezone",
+        "start_date",
+        "end_date",
+        "fields",
+        "jitter",
+        "dst_policy",
+    )
+
+    DST_POLICIES = ("skip", "first", "both", "next_valid")
 
     def __init__(
         self,
@@ -78,7 +92,13 @@ class CronTrigger(BaseTrigger):
         end_date=None,
         timezone=None,
         jitter=None,
+        dst_policy="first",
     ):
+        if dst_policy not in self.DST_POLICIES:
+            raise ValueError(
+                "dst_policy must be one of: " + ", ".join(self.DST_POLICIES)
+            )
+
         if timezone:
             self.timezone = astimezone(timezone)
         elif isinstance(start_date, datetime) and start_date.tzinfo:
@@ -88,10 +108,21 @@ class CronTrigger(BaseTrigger):
         else:
             self.timezone = get_localzone()
 
-        self.start_date = convert_to_datetime(start_date, self.timezone, "start_date")
-        self.end_date = convert_to_datetime(end_date, self.timezone, "end_date")
+        self.start_date = self._convert_datetime(
+            convert_to_datetime(start_date, self.timezone, "start_date")
+        )
+        self.end_date = self._convert_datetime(
+            convert_to_datetime(end_date, self.timezone, "end_date")
+        )
+        if (
+            self.start_date
+            and self.end_date
+            and self.end_date.timestamp() < self.start_date.timestamp()
+        ):
+            raise ValueError("end_date cannot be earlier than start_date")
 
         self.jitter = jitter
+        self.dst_policy = dst_policy
 
         values = dict(
             (key, value)
@@ -117,15 +148,16 @@ class CronTrigger(BaseTrigger):
             self.fields.append(field)
 
     @classmethod
-    def from_crontab(cls, expr, timezone=None):
+    def from_crontab(cls, expr, timezone=None, dst_policy="first"):
         """
         Create a :class:`~CronTrigger` from a standard crontab expression.
 
         See https://en.wikipedia.org/wiki/Cron for more information on the format accepted here.
 
         :param expr: minute, hour, day of month, month, day of week
-        :param datetime.tzinfo|str timezone: time zone to use for the date/time calculations (
-            defaults to scheduler timezone)
+        :param datetime.tzinfo|str timezone: time zone to use for the date/time calculations
+            (defaults to scheduler timezone)
+        :param str dst_policy: controls how daylight saving time gaps and folds are handled
         :return: a :class:`~CronTrigger` instance
 
         """
@@ -140,7 +172,15 @@ class CronTrigger(BaseTrigger):
             month=values[3],
             day_of_week=values[4],
             timezone=timezone,
+            dst_policy=dst_policy,
         )
+
+    def _convert_datetime(self, value):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=self.timezone, fold=0)
+        return value.astimezone(self.timezone)
 
     def _increment_field_value(self, dateval, fieldnum):
         """
@@ -183,9 +223,12 @@ class CronTrigger(BaseTrigger):
                     i += 1
 
         difference = datetime(**values) - dateval.replace(tzinfo=None)
-        dateval = datetime.fromtimestamp(
-            dateval.timestamp() + difference.total_seconds(), self.timezone
-        )
+        timestamp = dateval.timestamp() + difference.total_seconds()
+        dateval = datetime.fromtimestamp(timestamp, self.timezone)
+        wall_dateval = datetime(**values, tzinfo=self.timezone, fold=dateval.fold)
+        target_dateval = datetime(**values)
+        if fieldnum >= 0 and dateval.replace(tzinfo=None) < target_dateval:
+            dateval = wall_dateval
         return dateval, fieldnum
 
     def _set_field_value(self, dateval, fieldnum, new_value):
@@ -201,16 +244,14 @@ class CronTrigger(BaseTrigger):
 
         return datetime(**values, tzinfo=self.timezone, fold=dateval.fold)
 
-    def get_next_fire_time(self, previous_fire_time, now):
-        if previous_fire_time:
-            start_date = min(now, previous_fire_time + timedelta(microseconds=1))
-            if start_date == previous_fire_time:
-                start_date += timedelta(microseconds=1)
+    def _calculate_next_wall_time(self, start_date):
+        if start_date.tzinfo is None:
+            next_date = datetime_ceil(start_date).replace(
+                tzinfo=self.timezone, fold=0
+            )
         else:
-            start_date = max(now, self.start_date) if self.start_date else now
-
+            next_date = datetime_ceil(start_date.astimezone(self.timezone))
         fieldnum = 0
-        next_date = datetime_ceil(start_date).astimezone(self.timezone)
         while 0 <= fieldnum < len(self.fields):
             field = self.fields[fieldnum]
             curr_value = field.get_value(next_date)
@@ -234,22 +275,147 @@ class CronTrigger(BaseTrigger):
                 # A valid value was found, no changes necessary
                 fieldnum += 1
 
-            # Return if the date has rolled past the end date
-            if self.end_date and next_date > self.end_date:
+            if (
+                self.end_date
+                and next_date.timestamp() > self.end_date.timestamp()
+            ):
                 return None
 
-        if fieldnum >= 0:
-            next_date = self._apply_jitter(next_date, self.jitter, now)
-            return min(next_date, self.end_date) if self.end_date else next_date
+        if fieldnum < 0:
+            return None
+
+        return next_date
+
+    def _resolve_dst(self, dateval):
+        earliest_raw = dateval.replace(fold=0)
+        latest_raw = dateval.replace(fold=1)
+        earliest = datetime.fromtimestamp(earliest_raw.timestamp(), self.timezone)
+        latest = datetime.fromtimestamp(latest_raw.timestamp(), self.timezone)
+
+        if earliest.timestamp() == latest.timestamp():
+            return [(earliest, False)], earliest
+
+        wall_time = dateval.replace(tzinfo=None)
+        is_gap = (
+            earliest.replace(tzinfo=None) != wall_time
+            or latest.replace(tzinfo=None) != wall_time
+        )
+        concrete_times = sorted((earliest, latest), key=lambda dt: dt.timestamp())
+        concrete_times = [(fire_time, is_gap) for fire_time in concrete_times]
+
+        boundary = max(concrete_times, key=lambda value: value[0].timestamp())
+        if self.dst_policy == "skip":
+            return [], boundary[0]
+        elif self.dst_policy == "first":
+            return [concrete_times[0]], boundary[0]
+        elif self.dst_policy == "next_valid":
+            return [concrete_times[-1]], boundary[0]
+        else:
+            return concrete_times, boundary[0]
+
+    def _get_fold_partner(self, previous_fire_time, start_date):
+        if self.dst_policy != "both":
+            return None
+
+        raw_date = datetime(
+            previous_fire_time.year,
+            previous_fire_time.month,
+            previous_fire_time.day,
+            previous_fire_time.hour,
+            previous_fire_time.minute,
+            previous_fire_time.second,
+            previous_fire_time.microsecond,
+            tzinfo=self.timezone,
+            fold=0,
+        )
+        candidates, _ = self._resolve_dst(raw_date)
+        if len(candidates) != 2:
+            return None
+
+        wall_time = raw_date.replace(tzinfo=None)
+        if any(
+            fire_time.replace(tzinfo=None) != wall_time for fire_time, _ in candidates
+        ):
+            return None
+
+        previous_timestamp = previous_fire_time.timestamp()
+        try:
+            partner = next(
+                fire_time
+                for fire_time, _ in candidates
+                if fire_time.timestamp() != previous_timestamp
+            )
+        except StopIteration:
+            return None
+
+        if partner.timestamp() < start_date.timestamp():
+            return None
+        if self.end_date and partner.timestamp() > self.end_date.timestamp():
+            return None
+        return partner
+
+    def get_next_fire_time(self, previous_fire_time, now):
+        previous_fire_time = self._convert_datetime(previous_fire_time)
+        now = self._convert_datetime(now)
+        if previous_fire_time:
+            start_date = min(now, previous_fire_time + timedelta(microseconds=1))
+            if start_date == previous_fire_time:
+                start_date += timedelta(microseconds=1)
+        else:
+            start_date = (
+                datetime.fromtimestamp(
+                    max(now.timestamp(), self.start_date.timestamp()), self.timezone
+                )
+                if self.start_date
+                else now
+            )
+
+        if previous_fire_time:
+            partner = self._get_fold_partner(previous_fire_time, start_date)
+            if partner is not None:
+                return self._apply_jitter(partner, self.jitter, now)
+
+        wall_start = start_date
+        threshold_timestamp = start_date.timestamp()
+        pending_fire_times = {}
+        while True:
+            next_date = self._calculate_next_wall_time(wall_start)
+            if next_date is None:
+                return None
+            fire_times, _ = self._resolve_dst(next_date)
+            for fire_time, is_gap_adjusted in fire_times:
+                if fire_time.timestamp() >= threshold_timestamp and (
+                    not self.end_date
+                    or fire_time.timestamp() <= self.end_date.timestamp()
+                ):
+                    timestamp = fire_time.timestamp()
+                    if timestamp not in pending_fire_times or not is_gap_adjusted:
+                        pending_fire_times[timestamp] = fire_time
+
+            wall_start = next_date.replace(tzinfo=None) + timedelta(microseconds=1)
+            following_date = self._calculate_next_wall_time(wall_start)
+            if pending_fire_times and (
+                following_date is None
+                or following_date.timestamp() >= min(pending_fire_times)
+            ):
+                earliest_timestamp = min(pending_fire_times)
+                fire_time = datetime.fromtimestamp(
+                    earliest_timestamp, self.timezone
+                )
+                fire_time = self._apply_jitter(fire_time, self.jitter, now)
+                return min(fire_time, self.end_date) if self.end_date else fire_time
 
     def __getstate__(self):
         return {
-            "version": 2,
-            "timezone": self.timezone,
+            "version": 3,
+            "timezone": timezone_repr(self.timezone)
+            if hasattr(self.timezone, "key")
+            else self.timezone,
             "start_date": self.start_date,
             "end_date": self.end_date,
             "fields": self.fields,
             "jitter": self.jitter,
+            "dst_policy": self.dst_policy,
         }
 
     def __setstate__(self, state):
@@ -257,10 +423,10 @@ class CronTrigger(BaseTrigger):
         if isinstance(state, tuple):
             state = state[1]
 
-        if state.get("version", 1) > 2:
+        if state.get("version", 1) > 3:
             raise ValueError(
                 f"Got serialized data for version {state['version']} of "
-                f"{self.__class__.__name__}, but only versions up to 2 can be handled"
+                f"{self.__class__.__name__}, but only versions up to 3 can be handled"
             )
 
         self.timezone = astimezone(state["timezone"])
@@ -268,6 +434,7 @@ class CronTrigger(BaseTrigger):
         self.end_date = state["end_date"]
         self.fields = state["fields"]
         self.jitter = state.get("jitter")
+        self.dst_policy = state.get("dst_policy", "first")
 
     def __str__(self):
         options = [f"{f.name}='{f}'" for f in self.fields if not f.is_default]
@@ -281,6 +448,8 @@ class CronTrigger(BaseTrigger):
             options.append(f"end_date={datetime_repr(self.end_date)!r}")
         if self.jitter:
             options.append(f"jitter={self.jitter}")
+        if self.dst_policy != "first":
+            options.append(f"dst_policy={self.dst_policy!r}")
 
         return "<{} ({}, timezone='{}')>".format(
             self.__class__.__name__,

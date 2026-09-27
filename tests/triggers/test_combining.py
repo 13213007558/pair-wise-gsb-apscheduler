@@ -7,6 +7,31 @@ from apscheduler.triggers.combining import AndTrigger, BaseCombiningTrigger, OrT
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.util import localize
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
+
+
+def test_combining_dst_both_keeps_fold_cursor():
+    timezone = ZoneInfo("Europe/Berlin")
+    trigger = OrTrigger(
+        [
+            CronTrigger(hour=2, minute=30, timezone=timezone, dst_policy="both"),
+            CronTrigger(hour=4, minute=30, timezone=timezone),
+        ]
+    )
+    now = datetime(2013, 10, 27, 1, 45, tzinfo=timezone)
+    first = trigger.get_next_fire_time(None, now)
+    second = trigger.get_next_fire_time(first, first + timedelta(microseconds=1))
+
+    assert first == datetime(2013, 10, 27, 2, 30, tzinfo=timezone, fold=0)
+    assert second == datetime(2013, 10, 27, 2, 30, tzinfo=timezone, fold=1)
+
+    restored = pickle.loads(pickle.dumps(trigger))
+    assert restored.triggers[0].dst_policy == "both"
+    assert restored.triggers[0].timezone.key == "Europe/Berlin"
+
 
 class TestAndTrigger:
     @pytest.fixture

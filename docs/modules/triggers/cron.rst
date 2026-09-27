@@ -60,20 +60,24 @@ Expression     Field Description
 Daylight saving time behavior
 -----------------------------
 
-The cron trigger works with the so-called "wall clock" time. Thus, if the selected time zone observes DST (daylight
-saving time), you should be aware that it may cause unexpected behavior with the cron trigger when entering or leaving
-DST. When switching from standard time to daylight saving time, clocks are moved either one hour or half an hour
-forward, depending on the time zone. Likewise, when switching back to standard time, clocks are moved one hour or half
-an hour backward. This will cause some time periods to either not exist at all, or be repeated. If your schedule would
-have the job executed on either one of these periods, it may execute more often or less often than expected.
-This is not a bug. If you wish to avoid this, either use a timezone that does not observe DST, e.g. UTC, or find out
-about the DST-switch times and avoid using them in your scheduling.
+The cron trigger uses local wall-clock time. When a configured wall-clock time does not exist during a forward
+transition (a gap), or occurs twice during a backward transition (a fold), the ``dst_policy`` option selects what
+should happen:
 
-For example, the following schedule may be problematic::
+* ``skip``: do not execute for the nominal wall-clock time
+* ``first``: use the earlier concrete instant represented by the wall-clock time
+* ``both``: execute for both concrete instants of a fold, or the two transition-adjacent representations of a gap
+* ``next_valid``: use the later concrete instant represented by the wall-clock time
 
-    # In the Europe/Helsinki timezone, this will not execute at all on the last sunday morning of March
-    # Likewise, it will execute twice on the last sunday morning of October
-    sched.add_job(job_function, 'cron', hour=3, minute=30)
+The default, ``first``, preserves the historical APScheduler behavior. The selected policy and IANA timezone
+identifier are retained when jobs are exported or otherwise serialized.
+
+For example, this configuration runs twice on the last Sunday morning in October when clocks fall back::
+
+    sched.add_job(
+        job_function, "cron", hour=2, minute=30,
+        timezone="Europe/Helsinki", dst_policy="both"
+    )
 
 
 Examples

@@ -279,7 +279,7 @@ def test_different_tz(timezone):
             {"minute": "*/30"},
             datetime(2013, 11, 3, 1, 35),
             0,
-            datetime(2013, 11, 3, 1),
+            datetime(2013, 11, 3, 2),
         ),
     ],
     ids=[
@@ -299,8 +299,177 @@ def test_dst_change(trigger_args, start_date, start_date_fold, correct_next_date
     timezone = ZoneInfo("US/Eastern")
     trigger = CronTrigger(timezone=timezone, **trigger_args)
     start_date = start_date.replace(tzinfo=timezone, fold=start_date_fold)
-    correct_next_date = correct_next_date.replace(tzinfo=timezone, fold=1)
+    correct_next_date = correct_next_date.replace(
+        tzinfo=timezone, fold=int(correct_next_date.hour == 1)
+    )
     assert str(trigger.get_next_fire_time(None, start_date)) == str(correct_next_date)
+
+
+@pytest.mark.parametrize(
+    "timezone_name, gap_start, fold_start, gap_expected, fold_expected",
+    [
+        (
+            "America/New_York",
+            datetime(2013, 3, 10),
+            datetime(2013, 11, 3),
+            {
+                "skip": [(3, 11, 2, 30, -240, 0)],
+                "first": [
+                    (3, 10, 1, 30, -300, 0),
+                    (3, 11, 2, 30, -240, 0),
+                ],
+                "both": [
+                    (3, 10, 1, 30, -300, 0),
+                    (3, 10, 3, 30, -240, 0),
+                    (3, 11, 2, 30, -240, 0),
+                ],
+                "next_valid": [
+                    (3, 10, 3, 30, -240, 0),
+                    (3, 11, 2, 30, -240, 0),
+                ],
+            },
+            {
+                "skip": [(11, 3, 2, 30, -300, 0)],
+                "first": [
+                    (11, 3, 2, 30, -300, 0),
+                    (11, 4, 2, 30, -300, 0),
+                ],
+                "both": [
+                    (11, 3, 2, 30, -300, 0),
+                    (11, 4, 2, 30, -300, 0),
+                ],
+                "next_valid": [
+                    (11, 3, 2, 30, -300, 0),
+                    (11, 4, 2, 30, -300, 0),
+                ],
+            },
+        ),
+        (
+            "Europe/Berlin",
+            datetime(2013, 3, 31),
+            datetime(2013, 10, 27),
+            {
+                "skip": [(4, 1, 2, 30, 120, 0)],
+                "first": [(3, 31, 1, 30, 60, 0), (4, 1, 2, 30, 120, 0)],
+                "both": [
+                    (3, 31, 1, 30, 60, 0),
+                    (3, 31, 3, 30, 120, 0),
+                    (4, 1, 2, 30, 120, 0),
+                ],
+                "next_valid": [(3, 31, 3, 30, 120, 0), (4, 1, 2, 30, 120, 0)],
+            },
+            {
+                "skip": [(10, 28, 2, 30, 60, 0)],
+                "first": [
+                    (10, 27, 2, 30, 120, 0),
+                    (10, 28, 2, 30, 60, 0),
+                ],
+                "both": [
+                    (10, 27, 2, 30, 120, 0),
+                    (10, 27, 2, 30, 60, 1),
+                    (10, 28, 2, 30, 60, 0),
+                ],
+                "next_valid": [
+                    (10, 27, 2, 30, 60, 1),
+                    (10, 28, 2, 30, 60, 0),
+                ],
+            },
+        ),
+        (
+            "Australia/Sydney",
+            datetime(2013, 4, 7),
+            datetime(2013, 10, 6),
+            {
+                "skip": [(4, 8, 2, 30, 600, 0)],
+                "first": [
+                    (4, 7, 2, 30, 660, 0),
+                    (4, 8, 2, 30, 600, 0),
+                ],
+                "both": [
+                    (4, 7, 2, 30, 660, 0),
+                    (4, 7, 2, 30, 600, 1),
+                    (4, 8, 2, 30, 600, 0),
+                ],
+                "next_valid": [
+                    (4, 7, 2, 30, 600, 1),
+                    (4, 8, 2, 30, 600, 0),
+                ],
+            },
+            {
+                "skip": [(10, 7, 2, 30, 660, 0)],
+                "first": [
+                    (10, 6, 1, 30, 600, 0),
+                    (10, 7, 2, 30, 660, 0),
+                ],
+                "both": [
+                    (10, 6, 1, 30, 600, 0),
+                    (10, 6, 3, 30, 660, 0),
+                    (10, 7, 2, 30, 660, 0),
+                ],
+                "next_valid": [
+                    (10, 6, 3, 30, 660, 0),
+                    (10, 7, 2, 30, 660, 0),
+                ],
+            },
+        ),
+    ],
+)
+def test_dst_policies(
+    timezone_name,
+    gap_start,
+    fold_start,
+    gap_expected,
+    fold_expected,
+):
+    timezone = ZoneInfo(timezone_name)
+    for start, expected in ((gap_start, gap_expected), (fold_start, fold_expected)):
+        for policy, values in expected.items():
+            trigger = CronTrigger(
+                hour=2,
+                minute=30,
+                timezone=timezone,
+                dst_policy=policy,
+            )
+            current = start.replace(tzinfo=timezone)
+            previous = None
+            for month, day, hour, minute, offset_minutes, fold in values:
+                fire_time = trigger.get_next_fire_time(previous, current)
+                assert fire_time.year == start.year
+                assert fire_time.month == month
+                assert fire_time.day == day
+                assert fire_time.hour == hour
+                assert fire_time.minute == minute
+                assert fire_time.fold == fold
+                assert fire_time.utcoffset() == timedelta(minutes=offset_minutes)
+                previous = fire_time
+                current = fire_time + timedelta(microseconds=1)
+
+
+def test_invalid_dst_policy():
+    pytest.raises(
+        ValueError, CronTrigger, hour=2, minute=30, timezone="UTC", dst_policy="last"
+    ).match("dst_policy must be one of: skip, first, both, next_valid")
+
+
+def test_naive_and_pytz_datetime_comparison():
+    timezone = ZoneInfo("Europe/Berlin")
+    pytz_timezone = pytz.timezone("Europe/Berlin")
+    pytz_fold = pytz_timezone.localize(datetime(2013, 10, 27, 2, 30), False)
+    trigger = CronTrigger(
+        hour=2,
+        minute=30,
+        timezone=timezone,
+        dst_policy="next_valid",
+    )
+
+    naive_now = datetime(2013, 10, 27)
+    fold_time = trigger.get_next_fire_time(None, naive_now)
+    assert fold_time == datetime(2013, 10, 27, 2, 30, tzinfo=timezone, fold=1)
+
+    pytz_now = pytz_timezone.localize(datetime(2013, 10, 27))
+    pytz_fold_time = trigger.get_next_fire_time(None, pytz_now)
+    assert pytz_fold_time == fold_time
+    assert trigger._convert_datetime(pytz_fold) == fold_time
 
 
 def test_timezone_change(timezone):
@@ -334,6 +503,70 @@ def test_pickle(timezone):
 
     for attr in CronTrigger.__slots__:
         assert getattr(trigger2, attr) == getattr(trigger, attr)
+
+
+def test_dst_policy_pickle():
+    trigger = CronTrigger(
+        hour=2,
+        minute=30,
+        timezone="America/New_York",
+        dst_policy="next_valid",
+    )
+    restored = pickle.loads(pickle.dumps(trigger))
+
+    assert restored.dst_policy == "next_valid"
+    assert restored.timezone.key == "America/New_York"
+
+
+def test_dst_policy_state():
+    trigger = CronTrigger.__new__(CronTrigger)
+    trigger.__setstate__(
+        {
+            "version": 2,
+            "timezone": "America/New_York",
+            "start_date": None,
+            "end_date": None,
+            "fields": CronTrigger(hour=2, minute=30).fields,
+            "jitter": None,
+        }
+    )
+
+    assert trigger.dst_policy == "first"
+    assert trigger.timezone.key == "America/New_York"
+
+
+def test_dst_policy_end_date_boundary():
+    timezone = ZoneInfo("Europe/Berlin")
+    trigger = CronTrigger(
+        hour=2,
+        minute=30,
+        timezone=timezone,
+        dst_policy="both",
+        end_date=datetime(2013, 10, 27, 2, 30, fold=0, tzinfo=timezone),
+    )
+    assert trigger.get_next_fire_time(
+        None, datetime(2013, 10, 27, tzinfo=timezone)
+    ) == datetime(2013, 10, 27, 2, 30, tzinfo=timezone)
+
+    trigger.end_date = datetime(2013, 10, 26, tzinfo=timezone)
+    assert trigger.get_next_fire_time(
+        None, datetime(2013, 10, 27, tzinfo=timezone)
+    ) is None
+
+    trigger = CronTrigger(
+        hour=2,
+        minute=30,
+        timezone=timezone,
+        dst_policy="both",
+        end_date=datetime(2013, 3, 31, 3, 30, tzinfo=timezone),
+    )
+    previous = trigger.get_next_fire_time(
+        None, datetime(2013, 3, 31, tzinfo=timezone)
+    )
+    assert previous == datetime(2013, 3, 31, 1, 30, tzinfo=timezone)
+    assert trigger.get_next_fire_time(
+        previous, previous + timedelta(microseconds=1)
+    ) == datetime(2013, 3, 31, 3, 30, tzinfo=timezone)
 
 
 def test_jitter_produces_differrent_valid_results(timezone):
@@ -376,7 +609,7 @@ def test_jitter_with_timezone(timezone):
             {"minute": "*/30"},
             datetime(2013, 11, 3, 1, 35),
             True,
-            datetime(2013, 11, 3, 1),
+            datetime(2013, 11, 3, 2),
         ),
     ],
     ids=[

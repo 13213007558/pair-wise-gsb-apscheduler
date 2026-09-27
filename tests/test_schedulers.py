@@ -21,6 +21,7 @@ from apscheduler.events import (
     EVENT_JOB_EXECUTED,
     EVENT_JOB_MAX_INSTANCES,
     EVENT_JOB_MODIFIED,
+    EVENT_JOB_MISSED,
     EVENT_JOB_REMOVED,
     EVENT_JOB_SUBMITTED,
     EVENT_JOBSTORE_ADDED,
@@ -43,7 +44,13 @@ from apscheduler.schedulers import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.schedulers.base import STATE_RUNNING, STATE_STOPPED, BaseScheduler
 from apscheduler.triggers.base import BaseTrigger
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.util import undefined
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 
 class DummyScheduler(BaseScheduler):
@@ -473,7 +480,7 @@ class TestBaseScheduler:
         scheduler.start(paused=True)
         scheduler.add_job(lambda: None, "interval", id="testjob", seconds=1)
         scheduler.add_job(
-            lambda: None,
+            print,
             "cron",
             id="testjob",
             name="replacement",
@@ -746,6 +753,7 @@ Jobstore other:
             args=["foo", "bar"],
             kwargs={"end": ""},
             hour="*/3",
+            dst_policy="next_valid",
         )
         scheduler.add_job(
             print,
@@ -770,6 +778,16 @@ Jobstore other:
         assert isinstance(data, dict)
         assert data["version"] == 1
         assert data["scheduler_version"] == version
+        cron_states = [
+            job["trigger"]["__apscheduler_state__"]
+            for job in data["jobs"]
+            if job["trigger"]
+            .get("__apscheduler_class__", "")
+            .endswith(":CronTrigger")
+        ]
+        cron_state = cron_states[0]
+        assert cron_state["dst_policy"] == "next_valid"
+        assert cron_state["timezone"] == "Europe/Berlin"
 
         new_scheduler = DummyScheduler()
         new_scheduler.start(paused=True)
@@ -782,9 +800,11 @@ Jobstore other:
         assert job.name == "cronjob"
         assert job.args == ["foo", "bar"]
         assert job.kwargs == {"end": ""}
-        assert (
-            repr(job.trigger) == "<CronTrigger (hour='*/3', timezone='Europe/Berlin')>"
+        expected_repr = (
+            "<CronTrigger (hour='*/3', dst_policy='next_valid', "
+            "timezone='Europe/Berlin')>"
         )
+        assert repr(job.trigger) == expected_repr
 
         job = jobs.pop(0)
         assert job.name == "datejob"
@@ -810,6 +830,136 @@ Jobstore other:
             match="the scheduler must have been started for job export to work",
         ):
             scheduler.export_jobs(StringIO())
+
+    @pytest.mark.parametrize("coalesce", [False, True], ids=["all", "coalesced"])
+    def test_cron_fold_clock_advancement(self, freeze_time, coalesce):
+        freeze_time.set(
+            datetime(2013, 10, 27, 2, 30, tzinfo=ZoneInfo("Europe/Berlin"))
+        )
+        timezone = freeze_time.current.tzinfo
+        scheduler = DummyScheduler(
+            timezone=timezone,
+            executors={"default": DebugExecutor()},
+            job_defaults={"misfire_grace_time": 3600, "coalesce": coalesce},
+        )
+        events = []
+        scheduler.add_listener(events.append, EVENT_JOB_SUBMITTED)
+        scheduler.start()
+        scheduler.add_job(
+            lambda: None,
+            "cron",
+            hour=2,
+            minute=30,
+            dst_policy="both",
+            coalesce=coalesce,
+            next_run_time=freeze_time.current,
+        )
+        scheduler._process_jobs()
+        run_times = events[0].scheduled_run_times
+        assert len(run_times) == (2 if not coalesce else 1)
+        assert run_times[0] == datetime(
+            2013, 10, 27, 2, 30, tzinfo=timezone, fold=0
+        )
+        if not coalesce:
+            assert run_times[1] == datetime(
+                2013, 10, 27, 2, 30, tzinfo=timezone, fold=1
+            )
+
+        assert scheduler.get_jobs()[0].next_run_time == datetime(
+            2013, 10, 28, 2, 30, tzinfo=timezone
+        )
+
+    def test_cron_gap_skip_resume_and_end_date(self):
+        timezone = ZoneInfo("Europe/Berlin")
+        trigger = CronTrigger(
+            hour=2,
+            minute=30,
+            timezone=timezone,
+            dst_policy="skip",
+            end_date=datetime(2013, 3, 31, 0, 30, tzinfo=timezone),
+        )
+        assert trigger.get_next_fire_time(
+            None, datetime(2013, 3, 31, tzinfo=timezone)
+        ) is None
+
+        trigger.end_date = None
+        assert trigger.get_next_fire_time(
+            None, datetime(2013, 3, 31, 4, tzinfo=timezone)
+        ) == datetime(2013, 4, 1, 2, 30, tzinfo=timezone)
+
+    def test_cron_pause_resume_uses_current_time(self, freeze_time):
+        timezone = ZoneInfo("Europe/Berlin")
+        freeze_time.set(datetime(2013, 3, 30, tzinfo=timezone))
+        scheduler = DummyScheduler(timezone=timezone)
+        job = scheduler.add_job(
+            lambda: None,
+            "cron",
+            hour=2,
+            minute=30,
+            dst_policy="skip",
+        )
+        scheduler.pause_job(job.id)
+        assert job.next_run_time is None
+
+        freeze_time.set(datetime(2013, 3, 31, 4, tzinfo=timezone))
+        scheduler.resume_job(job.id)
+        assert job.next_run_time == datetime(
+            2013, 4, 1, 2, 30, tzinfo=timezone
+        )
+
+    def test_cron_fold_misfire_grace_time(self, freeze_time):
+        timezone = ZoneInfo("Europe/Berlin")
+        freeze_time.set(datetime(2013, 10, 27, 4, 30, tzinfo=timezone))
+        scheduler = DummyScheduler(
+            timezone=timezone,
+            executors={"default": DebugExecutor()},
+            job_defaults={"misfire_grace_time": 3600, "coalesce": False},
+        )
+        events = []
+        scheduler.add_listener(events.append, EVENT_JOB_MISSED)
+        scheduler.start()
+        scheduler.add_job(
+            lambda: None,
+            "cron",
+            hour=2,
+            minute=30,
+            dst_policy="both",
+            misfire_grace_time=3600,
+            next_run_time=datetime(2013, 10, 27, 2, 30, tzinfo=timezone),
+        )
+
+        scheduler._process_jobs()
+        run_times = [event.scheduled_run_time for event in events]
+        assert run_times == [
+            datetime(2013, 10, 27, 2, 30, tzinfo=timezone, fold=0),
+            datetime(2013, 10, 27, 2, 30, tzinfo=timezone, fold=1),
+        ]
+
+    def test_import_preserves_fold_run_time(self):
+        timezone = ZoneInfo("Europe/Berlin")
+        scheduler = DummyScheduler(timezone=timezone)
+        scheduler.start(paused=True)
+        scheduler.add_job(
+            print,
+            "cron",
+            hour=2,
+            minute=30,
+            dst_policy="next_valid",
+            next_run_time=datetime(
+                2013, 10, 27, 2, 30, tzinfo=timezone, fold=1
+            ),
+        )
+        buffer = StringIO()
+        scheduler.export_jobs(buffer)
+
+        new_scheduler = DummyScheduler(timezone=timezone)
+        new_scheduler.start(paused=True)
+        buffer.seek(0)
+        new_scheduler.import_jobs(buffer)
+        imported_job = new_scheduler.get_jobs()[0]
+        assert imported_job.next_run_time == datetime(
+            2013, 10, 27, 2, 30, tzinfo=timezone, fold=1
+        )
 
     @pytest.mark.parametrize(
         "config",

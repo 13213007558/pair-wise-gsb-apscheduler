@@ -288,6 +288,33 @@ class MemoryDataStore(BaseDataStore):
         return jobs
 
     async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
+        # Bail out if the job has already been released, or if it has been
+        # re-acquired by another scheduler after its lease expired, to ensure
+        # that each job is only ever released once, and only by its current owner
+        stored_job = self._jobs_by_id.get(result.job_id)
+        if stored_job is None:
+            self._logger.warning(
+                "Scheduler %s tried to release job %s, but it was already released",
+                scheduler_id,
+                result.job_id,
+            )
+            return
+
+        if (
+            stored_job.acquired_by is not None
+            and stored_job.acquired_by != scheduler_id
+        ):
+            self._logger.warning(
+                "Scheduler %s tried to release job %s, but it is currently acquired "
+                "by scheduler %s",
+                scheduler_id,
+                result.job_id,
+                stored_job.acquired_by,
+            )
+            return
+
+        job = stored_job
+
         # Record the job result
         if result.expires_at > result.finished_at:
             self._job_results[result.job_id] = result

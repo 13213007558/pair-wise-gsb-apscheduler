@@ -48,6 +48,7 @@ from apscheduler import (
     SchedulerStarted,
     SchedulerStopped,
     ScheduleUpdated,
+    StopState,
     TaskAdded,
     TaskDefaults,
     TaskUpdated,
@@ -1203,6 +1204,309 @@ class TestAsyncScheduler:
             # Check that the job outcome was set to "cancelled"
             result = await scheduler.get_job_result(job_id)
             assert result.outcome is JobOutcome.cancelled
+
+    async def test_graceful_stop_rejects_new_jobs(
+        self, raw_datastore: DataStore
+    ) -> None:
+        """
+        Test that once stop() has been called, no new jobs are acquired, while
+        the already running job is allowed to finish within the graceful stop
+        window.
+
+        """
+        job_started = anyio.Event()
+        job_continue = anyio.Event()
+
+        async def blocking_job() -> str:
+            job_started.set()
+            await job_continue.wait()
+            return "returnvalue"
+
+        released_events: list[JobReleased] = []
+        async with AsyncScheduler(
+            data_store=raw_datastore, graceful_stop_timeout=30
+        ) as scheduler:
+            await scheduler.configure_task("blocking_job", func=blocking_job)
+            first_job_id = await scheduler.add_job(
+                "blocking_job", result_expiration_time=15
+            )
+            await scheduler.start_in_background()
+            with fail_after(5):
+                await job_started.wait()
+
+            # Request a stop – this must immediately prevent new acquisitions
+            scheduler.subscribe(released_events.append, {JobReleased})
+            await scheduler.stop()
+            assert scheduler.state is RunState.stopping
+            assert scheduler.stop_state is StopState.requested
+
+            # Add another job; it must not get picked up anymore
+            second_job_id = await scheduler.add_job("blocking_job")
+            await sleep(0.5)
+            jobs = await scheduler.get_jobs()
+            assert len(jobs) == 2
+            jobs_by_id = {job.id: job for job in jobs}
+            assert jobs_by_id[first_job_id].acquired_by == scheduler.identity
+            assert jobs_by_id[second_job_id].acquired_by is None
+            assert len(scheduler._running_jobs) == 1
+
+            # Let the running job finish; the scheduler should then stop fully
+            job_continue.set()
+            with fail_after(5):
+                await scheduler.get_next_event(SchedulerStopped)
+
+            assert scheduler.state is RunState.stopped
+            assert scheduler.stop_state is StopState.drained
+            assert not scheduler._running_jobs
+
+            # The first job completed successfully and was released exactly once
+            assert [event.job_id for event in released_events] == [first_job_id]
+            assert released_events[0].outcome is JobOutcome.success
+            result = await scheduler.get_job_result(first_job_id)
+            assert result.outcome is JobOutcome.success
+            assert result.return_value == "returnvalue"
+
+            # The second job was never acquired, and no ghost claims remain
+            jobs = await scheduler.get_jobs()
+            assert len(jobs) == 1
+            assert jobs[0].id == second_job_id
+            assert jobs[0].acquired_by is None
+            tasks = await scheduler.get_tasks()
+            assert tasks[0].running_jobs == 0
+
+        # All the internal coordination state must have been cleaned up
+        assert scheduler._scheduler_cancel_scope is None
+        assert scheduler._stop_event is None
+
+    async def test_graceful_stop_timeout_cancels_running_jobs(
+        self, raw_datastore: DataStore
+    ) -> None:
+        """
+        Test that jobs still running when the graceful stop timeout expires are
+        cancelled, and that their leases, running job counters and results are
+        properly released.
+
+        """
+        job_started = anyio.Event()
+        never_set = anyio.Event()
+
+        async def blocking_job() -> None:
+            job_started.set()
+            await never_set.wait()
+
+        released_events: list[JobReleased] = []
+        async with AsyncScheduler(
+            data_store=raw_datastore,
+            graceful_stop_timeout=timedelta(milliseconds=200),
+        ) as scheduler:
+            await scheduler.configure_task("blocking_job", func=blocking_job)
+            job_id = await scheduler.add_job(
+                "blocking_job", result_expiration_time=15
+            )
+            await scheduler.start_in_background()
+            with fail_after(5):
+                await job_started.wait()
+
+            scheduler.subscribe(released_events.append, {JobReleased})
+            await scheduler.stop()
+            assert scheduler.state is RunState.stopping
+            assert scheduler.stop_state is StopState.requested
+
+            with fail_after(5):
+                await scheduler.get_next_event(SchedulerStopped)
+
+            assert scheduler.state is RunState.stopped
+            assert scheduler.stop_state is StopState.timed_out
+            assert not scheduler._running_jobs
+
+            # The job was released exactly once, with the "cancelled" outcome
+            assert [event.job_id for event in released_events] == [job_id]
+            assert released_events[0].outcome is JobOutcome.cancelled
+
+            # The lease, running job counter and result were all released
+            assert not await scheduler.get_jobs()
+            tasks = await scheduler.get_tasks()
+            assert tasks[0].running_jobs == 0
+            result = await scheduler.get_job_result(job_id)
+            assert result.outcome is JobOutcome.cancelled
+
+    async def test_graceful_stop_without_timeout(
+        self, raw_datastore: DataStore
+    ) -> None:
+        """
+        Test that with graceful_stop_timeout=None, the scheduler waits
+        indefinitely for the running jobs to finish.
+
+        """
+        job_started = anyio.Event()
+        job_continue = anyio.Event()
+
+        async def blocking_job() -> None:
+            job_started.set()
+            await job_continue.wait()
+
+        async with AsyncScheduler(
+            data_store=raw_datastore, graceful_stop_timeout=None
+        ) as scheduler:
+            await scheduler.configure_task("blocking_job", func=blocking_job)
+            await scheduler.add_job("blocking_job")
+            await scheduler.start_in_background()
+            with fail_after(5):
+                await job_started.wait()
+
+            await scheduler.stop()
+
+            # The scheduler must not stop while the job is still running
+            await sleep(0.5)
+            assert scheduler.state is RunState.stopping
+            assert scheduler.stop_state is StopState.requested
+
+            # Once the job finishes, the scheduler drains and stops
+            job_continue.set()
+            with fail_after(5):
+                await scheduler.get_next_event(SchedulerStopped)
+
+            assert scheduler.state is RunState.stopped
+            assert scheduler.stop_state is StopState.drained
+            assert not scheduler._running_jobs
+
+    async def test_graceful_stop_repeated_stop_calls(
+        self, raw_datastore: DataStore
+    ) -> None:
+        """
+        Test that calling stop() multiple times is harmless, and that each job
+        is still released exactly once.
+
+        """
+        job_started = anyio.Event()
+        job_continue = anyio.Event()
+
+        async def blocking_job() -> None:
+            job_started.set()
+            await job_continue.wait()
+
+        released_events: list[JobReleased] = []
+        async with AsyncScheduler(
+            data_store=raw_datastore, graceful_stop_timeout=30
+        ) as scheduler:
+            await scheduler.configure_task("blocking_job", func=blocking_job)
+            job_id = await scheduler.add_job("blocking_job")
+            await scheduler.start_in_background()
+            with fail_after(5):
+                await job_started.wait()
+
+            scheduler.subscribe(released_events.append, {JobReleased})
+            await scheduler.stop()
+            await scheduler.stop()
+            await scheduler.stop()
+            assert scheduler.state is RunState.stopping
+            assert scheduler.stop_state is StopState.requested
+
+            job_continue.set()
+            with fail_after(5):
+                await scheduler.get_next_event(SchedulerStopped)
+
+            assert scheduler.state is RunState.stopped
+            assert scheduler.stop_state is StopState.drained
+            assert [event.job_id for event in released_events] == [job_id]
+            assert released_events[0].outcome is JobOutcome.success
+
+    async def test_graceful_stop_job_exception(
+        self, raw_datastore: DataStore
+    ) -> None:
+        """
+        Test that a job raising an exception during the graceful stop window is
+        released with the "error" outcome, and the scheduler still stops
+        cleanly.
+
+        """
+        job_started = anyio.Event()
+        job_continue = anyio.Event()
+
+        async def failing_job() -> None:
+            job_started.set()
+            await job_continue.wait()
+            raise RuntimeError("failing as requested")
+
+        async with AsyncScheduler(
+            data_store=raw_datastore, graceful_stop_timeout=30
+        ) as scheduler:
+            await scheduler.configure_task("failing_job", func=failing_job)
+            job_id = await scheduler.add_job(
+                "failing_job", result_expiration_time=15
+            )
+            await scheduler.start_in_background()
+            with fail_after(5):
+                await job_started.wait()
+
+            await scheduler.stop()
+            job_continue.set()
+            with fail_after(5):
+                await scheduler.get_next_event(SchedulerStopped)
+
+            assert scheduler.state is RunState.stopped
+            assert scheduler.stop_state is StopState.drained
+            assert not scheduler._running_jobs
+
+            result = await scheduler.get_job_result(job_id)
+            assert result.outcome is JobOutcome.error
+            assert isinstance(result.exception, RuntimeError)
+
+            # No leases or running job counters may have been left behind
+            assert not await scheduler.get_jobs()
+            tasks = await scheduler.get_tasks()
+            assert tasks[0].running_jobs == 0
+
+    async def test_restart_after_graceful_stop(
+        self, raw_datastore: DataStore
+    ) -> None:
+        """
+        Test that the scheduler can be restarted after a graceful stop, and that
+        it can acquire and run jobs again (leaving no leftover claims behind).
+
+        """
+        ran: list[int] = []
+
+        async def dummy_job(value: int) -> None:
+            ran.append(value)
+
+        async with AsyncScheduler(
+            data_store=raw_datastore, graceful_stop_timeout=30
+        ) as scheduler:
+            await scheduler.configure_task("dummy_job", func=dummy_job)
+            released = anyio.Event()
+            scheduler.subscribe(lambda _: released.set(), {JobReleased})
+            await scheduler.add_job("dummy_job", args=[1])
+            await scheduler.start_in_background()
+            with fail_after(5):
+                await released.wait()
+
+            await scheduler.stop()
+            with fail_after(5):
+                await scheduler.get_next_event(SchedulerStopped)
+
+            assert scheduler.state is RunState.stopped
+            assert not await scheduler.get_jobs()
+            tasks = await scheduler.get_tasks()
+            assert tasks[0].running_jobs == 0
+
+            # Restart the scheduler and check that jobs are acquired again
+            released = anyio.Event()
+            scheduler.subscribe(lambda _: released.set(), {JobReleased})
+            await scheduler.add_job("dummy_job", args=[2])
+            await scheduler.start_in_background()
+            assert scheduler.state is RunState.started
+            assert scheduler.stop_state is None
+            with fail_after(5):
+                await released.wait()
+
+            await scheduler.stop()
+            with fail_after(5):
+                await scheduler.get_next_event(SchedulerStopped)
+
+            assert scheduler.state is RunState.stopped
+
+        assert ran == [1, 2]
 
 
 class TestSyncScheduler:

@@ -6,6 +6,17 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **UNRELEASED**
 
+- Added graceful scheduler shutdown: when the scheduler is stopped, it immediately
+  stops acquiring new schedules and jobs, but lets running jobs finish within a
+  configurable grace period (the new ``graceful_stop_timeout`` scheduler option)
+  before cancelling them; the new ``stop_state`` scheduler property allows
+  tracking whether the stop was requested, all jobs drained in time, or the
+  timeout expired and the remaining jobs had to be cancelled
+- Fixed the data stores allowing a job to be released more than once, or by a
+  scheduler that no longer holds the job's lease (which could corrupt the task's
+  running job counter, or release a job currently owned by another scheduler)
+- Fixed ``SQLAlchemyDataStore`` double-counting running jobs when re-acquiring a
+  job whose previous lease had expired
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+

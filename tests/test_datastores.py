@@ -21,6 +21,7 @@ from apscheduler import (
     Event,
     Job,
     JobOutcome,
+    JobReleased,
     JobResult,
     Schedule,
     ScheduleAdded,
@@ -561,6 +562,101 @@ async def test_job_release_cancelled(datastore: DataStore) -> None:
     # Check that the job and its result are gone
     assert not await datastore.get_jobs({acquired[0].id})
     assert not await datastore.get_job_result(acquired[0].id)
+
+async def test_job_release_twice(datastore: DataStore) -> None:
+    """
+    Test that releasing the same job twice only takes effect once, and does not
+    corrupt the running job counter or emit a second JobReleased event.
+
+    """
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+
+    acquired = await datastore.acquire_jobs("worker1", timedelta(seconds=30), 1)
+    assert len(acquired) == 1
+
+    async with capture_events(datastore, 0, {JobReleased}) as events:
+        result = JobResult.from_job(acquired[0], JobOutcome.success)
+        await datastore.release_job("worker1", acquired[0], result)
+
+        # The second release attempt must be a no-op
+        await datastore.release_job("worker1", acquired[0], result)
+        await anyio.sleep(0.1)
+
+    assert len(events) == 1
+    assert events[0].job_id == job.id
+
+    # The running job counter must not have been decremented twice
+    task = await datastore.get_task("task1")
+    assert task.running_jobs == 0
+
+    # The job must be gone, with no ghost claim left behind
+    assert not await datastore.get_jobs()
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_job_release_from_another_scheduler(
+    datastore: DataStore, time_machine: TimeMachineFixture
+) -> None:
+    """
+    Test that a worker cannot release a job that has been re-acquired by another
+    worker after its lease expired.
+
+    """
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+
+    # worker1 acquires the job, but lets its lease expire, so worker2 picks it up
+    time_machine.move_to(datetime.now(timezone.utc), tick=False)
+    acquired1 = await datastore.acquire_jobs("worker1", timedelta(seconds=30), 1)
+    assert len(acquired1) == 1
+    time_machine.shift(31)
+    acquired2 = await datastore.acquire_jobs("worker2", timedelta(seconds=30), 1)
+    assert len(acquired2) == 1
+    assert acquired2[0].id == job.id
+
+    # worker1 now tries to release the job – this must not affect the job
+    # currently owned by worker2
+    async with capture_events(datastore, 0, {JobReleased}) as events:
+        await datastore.release_job(
+            "worker1",
+            acquired1[0],
+            JobResult.from_job(acquired1[0], JobOutcome.success),
+        )
+        await anyio.sleep(0.1)
+
+    assert not events
+    jobs = await datastore.get_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].acquired_by == "worker2"
+    task = await datastore.get_task("task1")
+    assert task.running_jobs == 1
+
+    # worker2 can still release the job normally
+    await datastore.release_job(
+        "worker2",
+        acquired2[0],
+        JobResult.from_job(acquired2[0], JobOutcome.success),
+    )
+    assert not await datastore.get_jobs()
+    task = await datastore.get_task("task1")
+    assert task.running_jobs == 0
+    result = await datastore.get_job_result(job.id)
+    assert result
+    assert result.outcome is JobOutcome.success
 
 
 @pytest.mark.skipif(

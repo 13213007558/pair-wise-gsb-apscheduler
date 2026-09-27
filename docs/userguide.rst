@@ -229,6 +229,23 @@ of the scheduler before the process terminates.
 
      asyncio.run(main())
 
+Stopping the scheduler
+----------------------
+
+Calling :meth:`~Scheduler.stop` signals the scheduler to shut down. The scheduler
+immediately stops acquiring new schedules and jobs, but gives the already running
+jobs a chance to finish, up to the ``graceful_stop_timeout`` scheduler option
+(as seconds or a :class:`~datetime.timedelta`; ``None`` waits indefinitely).
+Any jobs still running when the timeout expires are cancelled. The default
+timeout of ``0`` cancels running jobs immediately, matching the behavior of
+previous releases.
+
+The progress of the shutdown can be tracked via the
+:attr:`~AsyncScheduler.stop_state` property, which transitions from
+:attr:`~StopState.requested` to either :attr:`~StopState.drained` (all running
+jobs finished in time) or :attr:`~StopState.timed_out` (the timeout expired and
+the remaining jobs were cancelled).
+
 .. _configuring-tasks:
 
 Configuring tasks

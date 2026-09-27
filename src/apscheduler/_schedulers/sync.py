@@ -16,7 +16,13 @@ import attrs
 from anyio.from_thread import BlockingPortal, start_blocking_portal
 
 from .. import current_scheduler
-from .._enums import CoalescePolicy, ConflictPolicy, RunState, SchedulerRole
+from .._enums import (
+    CoalescePolicy,
+    ConflictPolicy,
+    RunState,
+    SchedulerRole,
+    StopState,
+)
 from .._events import Event, T_Event
 from .._structures import Job, JobResult, MetadataType, Schedule, Task, TaskDefaults
 from .._utils import UnsetValue, create_repr, unset
@@ -57,6 +63,7 @@ class Scheduler:
         max_concurrent_jobs: int = 100,
         cleanup_interval: float | timedelta | None = timedelta(minutes=15),
         lease_duration: timedelta = timedelta(seconds=30),
+        graceful_stop_timeout: float | timedelta | None = timedelta(0),
         job_executors: MutableMapping[str, JobExecutor] | None = None,
         task_defaults: TaskDefaults | None = None,
         logger: Logger | None = None,
@@ -85,6 +92,7 @@ class Scheduler:
             job_executors=job_executors or {},
             cleanup_interval=cleanup_interval,
             lease_duration=lease_duration,
+            graceful_stop_timeout=graceful_stop_timeout,
             **kwargs,
         )
         self.__attrs_init__(async_scheduler=async_scheduler)
@@ -122,6 +130,10 @@ class Scheduler:
         return self._async_scheduler.lease_duration
 
     @property
+    def graceful_stop_timeout(self) -> timedelta | None:
+        return self._async_scheduler.graceful_stop_timeout
+
+    @property
     def job_executors(self) -> MutableMapping[str, JobExecutor]:
         return self._async_scheduler.job_executors
 
@@ -133,6 +145,10 @@ class Scheduler:
     def state(self) -> RunState:
         """The current running state of the scheduler."""
         return self._async_scheduler.state
+
+    @property
+    def stop_state(self) -> StopState | None:
+        return self._async_scheduler.stop_state
 
     def __enter__(self: Self) -> Self:
         self._ensure_services_ready(self._exit_stack)

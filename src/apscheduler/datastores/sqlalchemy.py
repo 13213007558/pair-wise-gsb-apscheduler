@@ -970,7 +970,13 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             continue
 
                         task_job_slots_left[job.task_id] -= 1
-                        running_job_count_increments[job.task_id] += 1
+                        if job.acquired_until is None:
+                            # The job was not previously acquired, so count it as
+                            # a newly running job. If the previous lease merely
+                            # expired, the previous holder's count is abandoned
+                            # instead, so the counter must stay unchanged.
+                            running_job_count_increments[job.task_id] += 1
+
                         job.acquired_by = scheduler_id
                         job.acquired_until = acquired_until
                         acquired_jobs.append(job)
@@ -991,20 +997,23 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         await self._execute(conn, update)
 
                         # Increment the running job counters on each task
-                        p_id: BindParameter = bindparam("p_id")
-                        p_increment: BindParameter = bindparam("p_increment")
-                        params = [
-                            {"p_id": task_id, "p_increment": increment}
-                            for task_id, increment in running_job_count_increments.items()
-                        ]
-                        update = (
-                            self._t_tasks.update()
-                            .values(
-                                running_jobs=self._t_tasks.c.running_jobs + p_increment
+                        if running_job_count_increments:
+                            p_id: BindParameter = bindparam("p_id")
+                            p_increment: BindParameter = bindparam("p_increment")
+                            params = [
+                                {"p_id": task_id, "p_increment": increment}
+                                for task_id, increment
+                                in running_job_count_increments.items()
+                            ]
+                            update = (
+                                self._t_tasks.update()
+                                .values(
+                                    running_jobs=self._t_tasks.c.running_jobs
+                                    + p_increment
+                                )
+                                .where(self._t_tasks.c.id == p_id)
                             )
-                            .where(self._t_tasks.c.id == p_id)
-                        )
-                        await self._execute(conn, update, params)
+                            await self._execute(conn, update, params)
 
                     # Discard the jobs that could not start
                     for discard in discarded_jobs:
@@ -1069,9 +1078,40 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         )
 
     async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
+        event: JobReleased | None = None
         async for attempt in self._retry():
             with attempt:
                 async with self._begin_transaction() as conn:
+                    # Bail out if the job has already been released, or if it has
+                    # been re-acquired by another scheduler after its lease
+                    # expired, to ensure that each job is only ever released
+                    # once, and only by its current owner
+                    query = (
+                        select(self._t_jobs.c.acquired_by)
+                        .where(self._t_jobs.c.id == result.job_id)
+                        .with_for_update()
+                    )
+                    row = (await self._execute(conn, query)).one_or_none()
+                    if row is None:
+                        self._logger.warning(
+                            "Scheduler %s tried to release job %s, but it was "
+                            "already released",
+                            scheduler_id,
+                            result.job_id,
+                        )
+                        return
+
+                    acquired_by: str | None = row.acquired_by
+                    if acquired_by is not None and acquired_by != scheduler_id:
+                        self._logger.warning(
+                            "Scheduler %s tried to release job %s, but it is "
+                            "currently acquired by scheduler %s",
+                            scheduler_id,
+                            result.job_id,
+                            acquired_by,
+                        )
+                        return
+
                     event = await self._release_job(
                         conn,
                         result,
@@ -1081,8 +1121,9 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         job.scheduled_fire_time,
                     )
 
-        # Notify other schedulers
-        await self._event_broker.publish(event)
+        if event is not None:
+            # Notify other schedulers
+            await self._event_broker.publish(event)
 
     async def get_job_result(self, job_id: UUID) -> JobResult | None:
         async for attempt in self._retry():

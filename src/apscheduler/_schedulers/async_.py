@@ -31,7 +31,14 @@ from .. import JobAdded, SerializationError, TaskLookupError
 from .._context import current_async_scheduler, current_job
 from .._converters import as_enum, as_timedelta
 from .._decorators import TaskParameters, get_task_params
-from .._enums import CoalescePolicy, ConflictPolicy, JobOutcome, RunState, SchedulerRole
+from .._enums import (
+    CoalescePolicy,
+    ConflictPolicy,
+    JobOutcome,
+    RunState,
+    SchedulerRole,
+    StopState,
+)
 from .._events import (
     Event,
     JobReleased,
@@ -105,6 +112,10 @@ class AsyncScheduler:
         calls to :meth:`cleanup` – ``None`` to disable automatic clean-up
     :param lease_duration: maximum amount of time (as seconds or timedelta) that
         the scheduler can keep a lock on a schedule or task
+    :param graceful_stop_timeout: maximum amount of time (as seconds or timedelta)
+        to wait for running jobs to finish when the scheduler is stopped, before
+        cancelling them – ``None`` to wait indefinitely (the default, ``0``,
+        cancels running jobs immediately, matching the historical behavior)
     :param logger: the logger instance used to log events from the scheduler, data store
         and event broker
     """
@@ -133,13 +144,25 @@ class AsyncScheduler:
         default=timedelta(minutes=15),
     )
     lease_duration: timedelta = attrs.field(converter=as_timedelta, default=30)
+    graceful_stop_timeout: timedelta | None = attrs.field(
+        kw_only=True,
+        converter=as_timedelta,
+        validator=optional(instance_of(timedelta)),
+        default=timedelta(0),
+    )
     logger: Logger = attrs.field(kw_only=True, default=getLogger(__name__))
 
     _state: RunState = attrs.field(init=False, default=RunState.stopped)
+    _stop_state: StopState | None = attrs.field(init=False, default=None)
     _services_task_group: TaskGroup | None = attrs.field(init=False, default=None)
     _exit_stack: AsyncExitStack = attrs.field(init=False)
     _services_initialized: bool = attrs.field(init=False, default=False)
     _scheduler_cancel_scope: CancelScope | None = attrs.field(init=False, default=None)
+    _stop_event: anyio.Event | None = attrs.field(init=False, default=None)
+    _jobs_drained_event: anyio.Event | None = attrs.field(init=False, default=None)
+    _schedule_wakeup_event: anyio.Event | None = attrs.field(init=False, default=None)
+    _job_wakeup_event: anyio.Event | None = attrs.field(init=False, default=None)
+    _job_finished_event: anyio.Event | None = attrs.field(init=False, default=None)
     _running_jobs: set[Job] = attrs.field(init=False, factory=set)
     _task_callables: dict[str, Callable] = attrs.field(init=False, factory=dict)
 
@@ -218,12 +241,28 @@ class AsyncScheduler:
         assert delay > 0
         while self._state in (RunState.starting, RunState.started):
             await self.cleanup()
-            await sleep(delay)
+            assert self._stop_event is not None
+            with move_on_after(delay):
+                await self._stop_event.wait()
 
     @property
     def state(self) -> RunState:
         """The current running state of the scheduler."""
         return self._state
+
+    @property
+    def stop_state(self) -> StopState | None:
+        """
+        The state of the graceful stop process, or ``None`` if no stop has been
+        requested since the scheduler was last started.
+
+        This transitions from :attr:`~StopState.requested` to either
+        :attr:`~StopState.drained` (all running jobs finished within the graceful
+        stop timeout) or :attr:`~StopState.timed_out` (the graceful stop timeout
+        expired and the remaining jobs were cancelled).
+
+        """
+        return self._stop_state
 
     async def cleanup(self) -> None:
         """Clean up expired job results and finished schedules."""
@@ -821,13 +860,28 @@ class AsyncScheduler:
         """
         Signal the scheduler that it should stop processing schedules.
 
+        The scheduler immediately stops acquiring new schedules and jobs, but jobs
+        that are already running are given a chance to finish, up to the
+        configured graceful stop timeout (the graceful_stop_timeout parameter).
+        Any jobs still running when the timeout expires are cancelled. The
+        progress of this process can be tracked via the stop_state property.
+
         This method does not wait for the scheduler to actually stop.
         For that, see :meth:`wait_until_stopped`.
 
         """
-        if self._state is RunState.started and self._scheduler_cancel_scope:
+        if self._state is RunState.started and self._stop_event is not None:
             self._state = RunState.stopping
-            self._scheduler_cancel_scope.cancel()
+            self._stop_state = StopState.requested
+            self._stop_event.set()
+
+            # Wake up the schedule and job processing loops so that they can
+            # begin shutting down right away
+            if self._schedule_wakeup_event is not None:
+                self._schedule_wakeup_event.set()
+
+            if self._job_wakeup_event is not None:
+                self._job_wakeup_event.set()
 
     async def wait_until_stopped(self) -> None:
         """
@@ -859,8 +913,15 @@ class AsyncScheduler:
             )
 
         self._state = RunState.starting
+        self._stop_state = None
         async with AsyncExitStack() as exit_stack:
             await self._ensure_services_initialized(exit_stack)
+
+            # Set up the events used to coordinate a graceful stop
+            self._stop_event = anyio.Event()
+            exit_stack.callback(setattr, self, "_stop_event", None)
+            self._jobs_drained_event = anyio.Event()
+            exit_stack.callback(setattr, self, "_jobs_drained_event", None)
 
             # Set this scheduler as the current scheduler
             token = current_async_scheduler.set(self)
@@ -871,6 +932,13 @@ class AsyncScheduler:
                 async with create_task_group() as task_group:
                     self._scheduler_cancel_scope = task_group.cancel_scope
                     exit_stack.callback(setattr, self, "_scheduler_cancel_scope", None)
+
+                    # Start the task that shuts the scheduler down once a stop has
+                    # been requested and the running jobs have been drained
+                    task_group.start_soon(
+                        self._stop_watcher,
+                        name=f"Scheduler {self.identity!r} stop watcher",
+                    )
 
                     # Start periodic cleanups
                     if self.cleanup_interval:
@@ -922,8 +990,29 @@ class AsyncScheduler:
                         SchedulerStopped(exception=exception)
                     )
 
+    async def _stop_watcher(self) -> None:
+        """
+        Shut the scheduler down once a stop has been requested.
+
+        Waits for the stop to be requested, then for the job processing loop to
+        finish draining the running jobs, and finally cancels the scheduler's
+        cancel scope to make :meth:`run_until_stopped` return.
+
+        """
+        assert self._stop_event is not None
+        await self._stop_event.wait()
+
+        # Wait for any running jobs to be drained (or cancelled on timeout)
+        if self.role in (SchedulerRole.worker, SchedulerRole.both):
+            assert self._jobs_drained_event is not None
+            await self._jobs_drained_event.wait()
+
+        # Shut down the remaining service tasks
+        if self._scheduler_cancel_scope is not None:
+            self._scheduler_cancel_scope.cancel()
+
     async def _process_schedules(self, *, task_status: TaskStatus[None]) -> None:
-        wakeup_event = anyio.Event()
+        self._schedule_wakeup_event = anyio.Event()
         wakeup_deadline: datetime | None = None
 
         async def schedule_added_or_modified(event: Event) -> None:
@@ -931,12 +1020,13 @@ class AsyncScheduler:
             if not wakeup_deadline or (
                 event_.next_fire_time and event_.next_fire_time < wakeup_deadline
             ):
+                assert self._schedule_wakeup_event is not None
                 self.logger.debug(
                     "Detected a %s event – waking up the scheduler to process "
                     "schedules",
                     type(event).__name__,
                 )
-                wakeup_event.set()
+                self._schedule_wakeup_event.set()
 
         async def extend_schedule_leases(schedules: Sequence[Schedule]) -> None:
             schedule_ids = {schedule.id for schedule in schedules}
@@ -1083,8 +1173,9 @@ class AsyncScheduler:
                         self.logger.debug("Waiting for any due schedules to appear")
 
                     with move_on_after(wait_time):
-                        await wakeup_event.wait()
-                        wakeup_event = anyio.Event()
+                        assert self._schedule_wakeup_event is not None
+                        await self._schedule_wakeup_event.wait()
+                        self._schedule_wakeup_event = anyio.Event()
                 else:
                     self.logger.debug("Processing more schedules on the next iteration")
 
@@ -1111,69 +1202,113 @@ class AsyncScheduler:
             ) from exc
 
     async def _process_jobs(self, *, task_status: TaskStatus[None]) -> None:
-        wakeup_event = anyio.Event()
+        self._job_wakeup_event = anyio.Event()
+        self._job_finished_event = anyio.Event()
 
         async def check_queue_capacity(event: Event) -> None:
-            if len(self._running_jobs) < self.max_concurrent_jobs:
-                wakeup_event.set()
+            if (
+                len(self._running_jobs) < self.max_concurrent_jobs
+                and self._job_wakeup_event is not None
+            ):
+                self._job_wakeup_event.set()
 
         async def extend_job_leases() -> None:
-            while self._state in (RunState.starting, RunState.started):
+            # Keep extending the leases of running jobs even while the scheduler
+            # is stopping, so that they are not re-acquired by other schedulers
+            # during the graceful stop window
+            while (
+                self._state in (RunState.starting, RunState.started)
+                or self._running_jobs
+            ):
                 await sleep(self.lease_duration.total_seconds() / 2)
                 if job_ids := {job.id for job in self._running_jobs}:
                     await self.data_store.extend_acquired_job_leases(
                         self.identity, job_ids, self.lease_duration
                     )
 
-        # If there are any jobs marked as being acquired by this scheduler, release them
-        # with the "abandoned" outcome right away
-        await self.data_store.reap_abandoned_jobs(self.identity)
+        try:
+            # If there are any jobs marked as being acquired by this scheduler,
+            # release them with the "abandoned" outcome right away
+            await self.data_store.reap_abandoned_jobs(self.identity)
 
-        async with AsyncExitStack() as exit_stack:
-            # Start the job executors
-            for job_executor in self.job_executors.values():
-                await job_executor.start(exit_stack)
+            async with AsyncExitStack() as exit_stack:
+                # Start the job executors
+                for job_executor in self.job_executors.values():
+                    await job_executor.start(exit_stack)
 
-            task_group = await exit_stack.enter_async_context(create_task_group())
-            task_group.start_soon(
-                extend_job_leases,
-                name=f"Scheduler {self.identity!r} job lease extension loop",
-            )
-
-            # Fetch new jobs every time
-            exit_stack.enter_context(
-                self.event_broker.subscribe(
-                    check_queue_capacity, {JobAdded, JobReleased}
+                task_group = await exit_stack.enter_async_context(create_task_group())
+                task_group.start_soon(
+                    extend_job_leases,
+                    name=f"Scheduler {self.identity!r} job lease extension loop",
                 )
-            )
 
-            # Signal that we are ready, and wait for the scheduler start event
-            task_status.started()
-            await self.get_next_event(SchedulerStarted)
-
-            while self._state is RunState.started:
-                limit = self.max_concurrent_jobs - len(self._running_jobs)
-                if limit > 0:
-                    jobs = await self.data_store.acquire_jobs(
-                        self.identity, self.lease_duration, limit
+                # Fetch new jobs every time
+                exit_stack.enter_context(
+                    self.event_broker.subscribe(
+                        check_queue_capacity, {JobAdded, JobReleased}
                     )
-                    for job in jobs:
-                        task = await self.data_store.get_task(job.task_id)
-                        func = self._get_task_callable(task)
-                        self._running_jobs.add(job)
-                        task_group.start_soon(
-                            self._run_job,
-                            job,
-                            func,
-                            job.executor,
-                            name=(
-                                f"Scheduler {self.identity!r} job {job.id} "
-                                f"({job.executor!r})"
-                            ),
-                        )
+                )
 
-                await wakeup_event.wait()
-                wakeup_event = anyio.Event()
+                # Signal that we are ready, and wait for the scheduler start event
+                task_status.started()
+                await self.get_next_event(SchedulerStarted)
+
+                while self._state is RunState.started:
+                    limit = self.max_concurrent_jobs - len(self._running_jobs)
+                    if limit > 0:
+                        jobs = await self.data_store.acquire_jobs(
+                            self.identity, self.lease_duration, limit
+                        )
+                        for job in jobs:
+                            task = await self.data_store.get_task(job.task_id)
+                            func = self._get_task_callable(task)
+                            self._running_jobs.add(job)
+                            task_group.start_soon(
+                                self._run_job,
+                                job,
+                                func,
+                                job.executor,
+                                name=(
+                                    f"Scheduler {self.identity!r} job {job.id} "
+                                    f"({job.executor!r})"
+                                ),
+                            )
+
+                    assert self._job_wakeup_event is not None
+                    await self._job_wakeup_event.wait()
+                    self._job_wakeup_event = anyio.Event()
+
+                # The scheduler is stopping, so no new jobs will be acquired from
+                # this point on. Wait for the running jobs to finish, up to the
+                # graceful stop timeout, and cancel whatever is left after that.
+                if self._running_jobs:
+                    timeout = self.graceful_stop_timeout
+                    with move_on_after(
+                        timeout.total_seconds() if timeout is not None else None
+                    ):
+                        while self._running_jobs:
+                            assert self._job_finished_event is not None
+                            await self._job_finished_event.wait()
+                            self._job_finished_event = anyio.Event()
+
+                    if self._running_jobs:
+                        self._stop_state = StopState.timed_out
+                        self.logger.info(
+                            "The graceful stop timeout expired – cancelling %d "
+                            "job(s) still running",
+                            len(self._running_jobs),
+                        )
+                    else:
+                        self._stop_state = StopState.drained
+                else:
+                    self._stop_state = StopState.drained
+
+                # Cancel the lease extension loop and any jobs that did not finish
+                # within the graceful stop timeout
+                task_group.cancel_scope.cancel()
+        finally:
+            if self._jobs_drained_event is not None:
+                self._jobs_drained_event.set()
 
     async def _run_job(self, job: Job, func: Callable[..., Any], executor: str) -> None:
         try:
@@ -1231,3 +1366,5 @@ class AsyncScheduler:
                 current_job.reset(token)
         finally:
             self._running_jobs.remove(job)
+            if self._job_finished_event is not None:
+                self._job_finished_event.set()

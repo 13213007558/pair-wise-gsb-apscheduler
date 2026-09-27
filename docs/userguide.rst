@@ -382,6 +382,73 @@ number of built-in trigger classes:
   use when you want to run the task on calendar-based intervals, at a specific time of
   day
 
+Scheduling tasks in batches
+---------------------------
+
+When deploying a set of interdependent schedules, it is often undesirable to
+expose the intermediate states of the deployment to the rest of the system.
+For that, you can use :meth:`Scheduler.add_schedules` (or
+:meth:`AsyncScheduler.add_schedules`) which adds all the schedules in the batch
+atomically: either all of them are added, or none of them are. This also covers
+any task definitions that need to be created along the way -- a failed batch
+never leaves behind new tasks, never modifies existing tasks and never replaces
+existing schedules only partially. Likewise, events representing the changes
+(:class:`~apscheduler.TaskAdded`, :class:`~apscheduler.ScheduleAdded` and so on)
+are only published after the batch has been successfully committed, so event
+subscribers can never observe intermediate states that could still be rolled
+back.
+
+Each entry in the batch is a dictionary of keyword arguments that mirrors the
+parameters of :meth:`~Scheduler.add_schedule`::
+
+    # Synchronous scheduler
+    schedule_ids = scheduler.add_schedules([
+        {
+            "func_or_task_id": "reports",
+            "trigger": CronTrigger(day_of_week="mon-fri", hour=8),
+            "id": "weekday-reports",
+        },
+        {
+            "func_or_task_id": "reports",
+            "trigger": CronTrigger(day_of_week="sat-sun", hour=10),
+            "id": "weekend-reports",
+            "args": ["weekend"],
+        },
+    ], conflict_policy=ConflictPolicy.exception)
+
+    # Asynchronous scheduler
+    schedule_ids = await scheduler.add_schedules([
+        {"func_or_task_id": my_task, "trigger": trigger, "id": "my-schedule"},
+    ])
+
+The method returns the IDs of the schedules in the batch, in the same order.
+An empty batch is a no-op that simply returns an empty list.
+
+The batch is validated in its entirety before anything is written to the data
+store:
+
+* Duplicate schedule IDs within the batch, missing required parameters
+  (``func_or_task_id`` and ``trigger``), unknown parameters and conflicting
+  definitions of the same task raise :exc:`ValueError`
+* If computing the first fire time of any trigger fails, the exception is
+  propagated and nothing is stored
+* The triggers are only advanced on internal copies, so the trigger objects
+  held by the caller are never mutated, even if the batch fails
+* If a schedule ID conflicts with an existing schedule, the given
+  ``conflict_policy`` (``replace``, ``do_nothing`` or ``exception``) is applied
+  to the batch as a whole
+* If the data store fails to commit the batch, its transaction is rolled back,
+  leaving the previously stored tasks and schedules untouched
+
+.. note::
+
+    Atomic batch addition is currently supported by the memory data store and
+    :class:`~apscheduler.datastores.sqlalchemy.SQLAlchemyDataStore` (including
+    SQLite). Data stores that cannot guarantee atomicity explicitly raise
+    :exc:`NotImplementedError` rather than emulating it with multiple
+    non-atomic writes.
+
+
 Combining multiple triggers
 ---------------------------
 

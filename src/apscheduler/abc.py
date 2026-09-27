@@ -238,6 +238,38 @@ class DataStore(metaclass=ABCMeta):
             existing schedule with the same ID
         """
 
+    async def add_schedules(
+        self,
+        schedules: Sequence[Schedule],
+        conflict_policy: ConflictPolicy,
+        *,
+        tasks: Sequence[Task] = (),
+    ) -> None:
+        """
+        Atomically add a batch of schedules (and any required task definitions) to
+        the data store.
+
+        Either all of the given schedules and tasks are added, or none of them are.
+        Implementations must not emulate atomicity by inserting the items one by one
+        in separate transactions. Events representing the changes must only be
+        published after the batch has been durably committed.
+
+        The default implementation raises :exc:`NotImplementedError`, as not all
+        data stores are capable of atomic batch operations.
+
+        :param schedules: the schedules to be added (must not contain duplicate IDs)
+        :param conflict_policy: policy that determines what to do if there are
+            existing schedules with the same IDs
+        :param tasks: task definitions to be added or updated as part of the same
+            atomic operation
+        :raises NotImplementedError: if the data store does not support atomic batch
+            operations
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support atomically adding batches of "
+            f"schedules"
+        )
+
     @abstractmethod
     async def remove_schedules(self, ids: Iterable[str]) -> None:
         """

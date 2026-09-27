@@ -6,6 +6,12 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **UNRELEASED**
 
+- Added the ``add_schedules()`` scheduler method (along with the corresponding
+  ``DataStore.add_schedules()`` method) which adds a batch of schedules (and any
+  required task definitions) atomically, publishing the resulting events only
+  after the batch has been committed. Currently implemented by the memory and
+  SQLAlchemy data stores; other data stores explicitly raise
+  ``NotImplementedError``
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+

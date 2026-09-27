@@ -6,7 +6,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from logging import Logger
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock
 
 import anyio
@@ -16,6 +16,7 @@ from pytest_mock.plugin import MockerFixture
 
 from apscheduler import (
     CoalescePolicy,
+    ConflictingIdError,
     ConflictPolicy,
     DeserializationError,
     Event,
@@ -188,6 +189,320 @@ async def test_replace_schedules(
     assert received_event.task_id == "foo"
     assert received_event.next_fire_time == datetime(2020, 9, 16, tzinfo=timezone.utc)
     assert not events
+
+
+async def test_add_schedules_batch(
+    datastore: DataStore, schedules: list[Schedule]
+) -> None:
+    tasks = [
+        Task(id="task1", func=None, job_executor="async"),
+        Task(id="task2", func=None, job_executor="async"),
+    ]
+    event_types = {TaskAdded, ScheduleAdded}
+    async with capture_events(datastore, 5, event_types) as events:
+        await datastore.add_schedules(schedules, ConflictPolicy.exception, tasks=tasks)
+
+        assert await datastore.get_schedules() == schedules
+        stored_tasks = await datastore.get_tasks()
+        assert [task.id for task in stored_tasks] == ["task1", "task2"]
+
+    added_tasks = {event.task_id for event in events if isinstance(event, TaskAdded)}
+    added_schedules = {
+        event.schedule_id for event in events if isinstance(event, ScheduleAdded)
+    }
+    assert added_tasks == {"task1", "task2"}
+    assert added_schedules == {"s1", "s2", "s3"}
+
+
+async def test_add_schedules_batch_empty(datastore: DataStore) -> None:
+    async with capture_events(datastore, 0) as events:
+        await datastore.add_schedules([], ConflictPolicy.exception)
+
+    assert not events
+    assert await datastore.get_schedules() == []
+
+
+async def test_add_schedules_batch_duplicate_ids(
+    datastore: DataStore, schedules: list[Schedule]
+) -> None:
+    with pytest.raises(ValueError, match="duplicate schedule IDs"):
+        await datastore.add_schedules(
+            [schedules[0], schedules[0]], ConflictPolicy.exception
+        )
+
+    assert await datastore.get_schedules() == []
+
+
+@pytest.mark.parametrize(
+    "conflict_policy", [ConflictPolicy.replace, ConflictPolicy.do_nothing]
+)
+async def test_add_schedules_batch_conflict_keep_or_replace(
+    datastore: DataStore, schedules: list[Schedule], conflict_policy: ConflictPolicy
+) -> None:
+    await datastore.add_schedules([schedules[0]], ConflictPolicy.exception)
+
+    trigger = DateTrigger(datetime(2020, 10, 1, tzinfo=timezone.utc))
+    replacement = Schedule(
+        id="s1", task_id="task1", job_executor="async", trigger=trigger
+    )
+    replacement.next_fire_time = trigger.next()
+
+    event_types = {ScheduleAdded, ScheduleUpdated}
+    expected_events = 2 if conflict_policy is ConflictPolicy.replace else 1
+    async with capture_events(datastore, expected_events, event_types) as events:
+        await datastore.add_schedules([replacement, schedules[1]], conflict_policy)
+
+    stored = {schedule.id: schedule for schedule in await datastore.get_schedules()}
+    assert set(stored) == {"s1", "s2"}
+    if conflict_policy is ConflictPolicy.replace:
+        assert stored["s1"].next_fire_time == replacement.next_fire_time
+        assert any(
+            isinstance(event, ScheduleUpdated) and event.schedule_id == "s1"
+            for event in events
+        )
+    else:
+        assert stored["s1"].next_fire_time == schedules[0].next_fire_time
+        assert not any(isinstance(event, ScheduleUpdated) for event in events)
+
+    assert any(
+        isinstance(event, ScheduleAdded) and event.schedule_id == "s2"
+        for event in events
+    )
+
+
+async def test_add_schedules_batch_conflict_exception(
+    datastore: DataStore, schedules: list[Schedule]
+) -> None:
+    await datastore.add_schedules(
+        [schedules[0]],
+        ConflictPolicy.exception,
+        tasks=[Task(id="task1", func=None, job_executor="async")],
+    )
+
+    trigger = DateTrigger(datetime(2020, 10, 1, tzinfo=timezone.utc))
+    replacement = Schedule(
+        id="s1", task_id="task1", job_executor="async", trigger=trigger
+    )
+    replacement.next_fire_time = trigger.next()
+
+    event_types = {TaskAdded, TaskUpdated, ScheduleAdded, ScheduleUpdated}
+    async with capture_events(datastore, 0, event_types) as events:
+        with pytest.raises(ConflictingIdError):
+            await datastore.add_schedules(
+                [replacement, schedules[1]],
+                ConflictPolicy.exception,
+                tasks=[Task(id="task2", func=None, job_executor="async")],
+            )
+
+    # The failed batch must not have added or modified anything, and no events
+    # representing the rolled back changes may have been published
+    assert not events
+    stored = await datastore.get_schedules()
+    assert [schedule.id for schedule in stored] == ["s1"]
+    assert stored[0].next_fire_time == schedules[0].next_fire_time
+    assert [task.id for task in await datastore.get_tasks()] == ["task1"]
+
+
+@pytest.mark.parametrize("fail_at", [1, 2, 3])
+async def test_add_schedules_batch_memory_write_failure(
+    datastore: DataStore,
+    schedules: list[Schedule],
+    monkeypatch: pytest.MonkeyPatch,
+    fail_at: int,
+) -> None:
+    if not isinstance(datastore, MemoryDataStore):
+        pytest.skip("only applicable to the memory data store")
+
+    import apscheduler.datastores.memory as memory_module
+
+    original_insort = memory_module.insort_right
+    call_count = 0
+
+    def failing_insort(*args: Any, **kwargs: Any) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == fail_at:
+            raise RuntimeError("injected failure")
+
+        original_insort(*args, **kwargs)
+
+    monkeypatch.setattr(memory_module, "insort_right", failing_insort)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        await datastore.add_schedules(
+            schedules,
+            ConflictPolicy.exception,
+            tasks=[Task(id="task1", func=None, job_executor="async")],
+        )
+
+    # The failed batch must not have left any partial state behind
+    assert await datastore.get_schedules() == []
+    assert await datastore.get_tasks() == []
+
+
+@pytest.mark.parametrize("fail_at", [1, 2, 3, 4, 5, 6])
+async def test_add_schedules_batch_sqlalchemy_write_failure(
+    tmp_path: Path,
+    local_broker: EventBroker,
+    logger: Logger,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_at: int,
+) -> None:
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    db_path = tmp_path / "test.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    try:
+        datastore = SQLAlchemyDataStore(engine)
+        async with AsyncExitStack() as exit_stack:
+            await local_broker.start(exit_stack, logger)
+            await datastore.start(exit_stack, local_broker, logger)
+
+            # Pre-existing data that must survive the failed batch untouched
+            await datastore.add_task(
+                Task(id="existing_task", func=None, job_executor="async")
+            )
+            trigger = DateTrigger(datetime(2020, 9, 13, tzinfo=timezone.utc))
+            existing_schedule = Schedule(
+                id="s_existing",
+                task_id="existing_task",
+                job_executor="async",
+                trigger=trigger,
+            )
+            existing_schedule.next_fire_time = trigger.next()
+            await datastore.add_schedule(existing_schedule, ConflictPolicy.exception)
+
+            # The batch: one task update, one new task, one replaced schedule and
+            # two new schedules (six statements in a single transaction)
+            new_trigger = DateTrigger(datetime(2020, 10, 1, tzinfo=timezone.utc))
+            replacement = Schedule(
+                id="s_existing",
+                task_id="existing_task",
+                job_executor="async",
+                trigger=new_trigger,
+            )
+            replacement.next_fire_time = new_trigger.next()
+            new_schedules = [replacement]
+            for i in (1, 2):
+                schedule = Schedule(
+                    id=f"s_new{i}",
+                    task_id="new_task",
+                    job_executor="async",
+                    trigger=trigger,
+                )
+                schedule.next_fire_time = trigger.next()
+                new_schedules.append(schedule)
+
+            batch_tasks = [
+                Task(
+                    id="existing_task",
+                    func=None,
+                    job_executor="async",
+                    max_running_jobs=5,
+                ),
+                Task(id="new_task", func=None, job_executor="async"),
+            ]
+
+            original_execute = SQLAlchemyDataStore._execute
+            call_count = 0
+
+            async def failing_execute(
+                self: SQLAlchemyDataStore,
+                conn: Any,
+                statement: Any,
+                parameters: Any = None,
+            ) -> Any:
+                nonlocal call_count
+                call_count += 1
+                if call_count == fail_at:
+                    raise RuntimeError("injected failure")
+
+                return await original_execute(self, conn, statement, parameters)
+
+            monkeypatch.setattr(SQLAlchemyDataStore, "_execute", failing_execute)
+            with pytest.raises(RuntimeError, match="injected failure"):
+                await datastore.add_schedules(
+                    new_schedules, ConflictPolicy.replace, tasks=batch_tasks
+                )
+
+            # The failed batch must have been rolled back in its entirety
+            stored_schedules = await datastore.get_schedules()
+            assert [schedule.id for schedule in stored_schedules] == ["s_existing"]
+            assert stored_schedules[0].next_fire_time == datetime(
+                2020, 9, 13, tzinfo=timezone.utc
+            )
+            stored_tasks = await datastore.get_tasks()
+            assert [task.id for task in stored_tasks] == ["existing_task"]
+            assert stored_tasks[0].max_running_jobs is None
+    finally:
+        await engine.dispose()
+
+    # Verify via an independent connection that nothing was committed
+    sync_engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with sync_engine.connect() as conn:
+            schedule_rows = conn.execute(text("SELECT id FROM schedules")).fetchall()
+            task_rows = conn.execute(
+                text("SELECT id, max_running_jobs FROM tasks")
+            ).fetchall()
+
+        assert [row[0] for row in schedule_rows] == ["s_existing"]
+        assert task_rows == [("existing_task", None)]
+    finally:
+        sync_engine.dispose()
+
+
+async def test_add_schedules_batch_sqlalchemy_commit_readback(
+    tmp_path: Path, local_broker: EventBroker, logger: Logger
+) -> None:
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    db_path = tmp_path / "test.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    try:
+        datastore = SQLAlchemyDataStore(engine)
+        async with AsyncExitStack() as exit_stack:
+            await local_broker.start(exit_stack, logger)
+            await datastore.start(exit_stack, local_broker, logger)
+
+            trigger = DateTrigger(datetime(2020, 9, 13, tzinfo=timezone.utc))
+            schedule = Schedule(
+                id="s1", task_id="task1", job_executor="async", trigger=trigger
+            )
+            schedule.next_fire_time = trigger.next()
+            await datastore.add_schedules(
+                [schedule],
+                ConflictPolicy.exception,
+                tasks=[Task(id="task1", func=None, job_executor="async")],
+            )
+    finally:
+        await engine.dispose()
+
+    # The committed batch must be visible to an independent connection
+    sync_engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with sync_engine.connect() as conn:
+            schedule_rows = conn.execute(
+                text("SELECT id, task_id FROM schedules")
+            ).fetchall()
+            task_rows = conn.execute(text("SELECT id FROM tasks")).fetchall()
+
+        assert schedule_rows == [("s1", "task1")]
+        assert task_rows == [("task1",)]
+    finally:
+        sync_engine.dispose()
+
+
+async def test_add_schedules_batch_not_supported() -> None:
+    pytest.importorskip("pymongo", reason="pymongo is not installed")
+
+    datastore = MongoDBDataStore("mongodb://localhost:27017")
+    trigger = DateTrigger(datetime(2020, 9, 13, tzinfo=timezone.utc))
+    schedule = Schedule(id="s1", task_id="task1", job_executor="async", trigger=trigger)
+    schedule.next_fire_time = trigger.next()
+    with pytest.raises(NotImplementedError, match="does not support atomically"):
+        await datastore.add_schedules([schedule], ConflictPolicy.exception)
 
 
 async def test_remove_schedules(

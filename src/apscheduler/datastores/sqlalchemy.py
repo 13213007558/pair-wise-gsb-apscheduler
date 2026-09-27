@@ -594,6 +594,148 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
             )
             await self._event_broker.publish(event)
 
+    async def add_schedules(
+        self,
+        schedules: Sequence[Schedule],
+        conflict_policy: ConflictPolicy,
+        *,
+        tasks: Sequence[Task] = (),
+    ) -> None:
+        schedule_ids = [schedule.id for schedule in schedules]
+        if len(set(schedule_ids)) != len(schedule_ids):
+            raise ValueError("The batch contains duplicate schedule IDs")
+
+        if not schedules and not tasks:
+            return
+
+        events: list[Event] = []
+        async for attempt in self._retry():
+            with attempt:
+                # Collected per attempt so that a retried attempt does not
+                # accumulate duplicate events
+                attempt_events: list[Event] = []
+                async with self._begin_transaction() as conn:
+                    if tasks:
+                        # Find out which of the given tasks already exist
+                        query = select(self._t_tasks.c.id).where(
+                            self._t_tasks.c.id.in_([task.id for task in tasks])
+                        )
+                        result = await self._execute(conn, query)
+                        existing_task_ids = {row[0] for row in result}
+
+                        # Insert the new tasks in one go
+                        insert_params = [
+                            {
+                                "id": task.id,
+                                "func": task.func,
+                                "job_executor": task.job_executor,
+                                "max_running_jobs": task.max_running_jobs,
+                                "misfire_grace_time": task.misfire_grace_time,
+                                "metadata": task.metadata,
+                            }
+                            for task in tasks
+                            if task.id not in existing_task_ids
+                        ]
+                        if insert_params:
+                            await self._execute(
+                                conn, self._t_tasks.insert(), insert_params
+                            )
+                            attempt_events.extend(
+                                TaskAdded(task_id=task.id)
+                                for task in tasks
+                                if task.id not in existing_task_ids
+                            )
+
+                        # Update the existing tasks in one go
+                        update_params = [
+                            {
+                                "task_id": task.id,
+                                "func": task.func,
+                                "job_executor": task.job_executor,
+                                "max_running_jobs": task.max_running_jobs,
+                                "misfire_grace_time": task.misfire_grace_time,
+                                "metadata": task.metadata,
+                            }
+                            for task in tasks
+                            if task.id in existing_task_ids
+                        ]
+                        if update_params:
+                            update = self._t_tasks.update().where(
+                                self._t_tasks.c.id == bindparam("task_id")
+                            )
+                            await self._execute(conn, update, update_params)
+                            attempt_events.extend(
+                                TaskUpdated(task_id=task.id)
+                                for task in tasks
+                                if task.id in existing_task_ids
+                            )
+
+                    if schedules:
+                        # Find out which of the given schedules already exist
+                        query = select(self._t_schedules.c.id).where(
+                            self._t_schedules.c.id.in_(schedule_ids)
+                        )
+                        result = await self._execute(conn, query)
+                        existing_ids = {row[0] for row in result}
+                        if existing_ids and conflict_policy is ConflictPolicy.exception:
+                            raise ConflictingIdError(sorted(existing_ids)[0])
+
+                        # Insert the new schedules in one go
+                        insert_params = [
+                            self._convert_outgoing_fire_times(
+                                schedule.marshal(self.serializer)
+                            )
+                            for schedule in schedules
+                            if schedule.id not in existing_ids
+                        ]
+                        if insert_params:
+                            await self._execute(
+                                conn, self._t_schedules.insert(), insert_params
+                            )
+                            attempt_events.extend(
+                                ScheduleAdded(
+                                    schedule_id=schedule.id,
+                                    task_id=schedule.task_id,
+                                    next_fire_time=schedule.next_fire_time,
+                                )
+                                for schedule in schedules
+                                if schedule.id not in existing_ids
+                            )
+
+                        # Replace the existing schedules in one go, unless the
+                        # conflict policy dictates that they be left alone
+                        if existing_ids and conflict_policy is ConflictPolicy.replace:
+                            update_params = []
+                            for schedule in schedules:
+                                if schedule.id not in existing_ids:
+                                    continue
+
+                                values = self._convert_outgoing_fire_times(
+                                    schedule.marshal(self.serializer)
+                                )
+                                values["schedule_id"] = values.pop("id")
+                                update_params.append(values)
+
+                            update = self._t_schedules.update().where(
+                                self._t_schedules.c.id == bindparam("schedule_id")
+                            )
+                            await self._execute(conn, update, update_params)
+                            attempt_events.extend(
+                                ScheduleUpdated(
+                                    schedule_id=schedule.id,
+                                    task_id=schedule.task_id,
+                                    next_fire_time=schedule.next_fire_time,
+                                )
+                                for schedule in schedules
+                                if schedule.id in existing_ids
+                            )
+
+                events = attempt_events
+
+        # Only publish the events once the transaction has been committed
+        for event in events:
+            await self._event_broker.publish(event)
+
     async def remove_schedules(self, ids: Iterable[str]) -> None:
         async for attempt in self._retry():
             with attempt:

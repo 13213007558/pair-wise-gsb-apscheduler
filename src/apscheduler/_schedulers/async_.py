@@ -6,6 +6,7 @@ import random
 import sys
 from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from contextlib import AsyncExitStack
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from inspect import isbuiltin, isclass, ismethod, ismodule
@@ -78,6 +79,56 @@ _zero_timedelta = timedelta()
 
 TaskType: TypeAlias = "Task | str | Callable[..., Any]"
 T = TypeVar("T")
+
+#: the keyword arguments accepted for each entry in
+#: :meth:`AsyncScheduler.add_schedules`
+_SCHEDULE_ENTRY_KEYS = frozenset(
+    {
+        "func_or_task_id",
+        "trigger",
+        "id",
+        "args",
+        "kwargs",
+        "paused",
+        "coalesce",
+        "job_executor",
+        "misfire_grace_time",
+        "metadata",
+        "max_jitter",
+        "job_result_expiration_time",
+    }
+)
+
+
+def _unwrap_callable(
+    func_or_task_id: TaskType, args: tuple, kwargs: dict[str, Any]
+) -> tuple[TaskType, tuple, dict[str, Any]]:
+    """
+    Unpack the function and positional + keyword arguments from a ``partial()`` or
+    a bound method.
+
+    """
+    # Unpack the function and positional + keyword arguments from a partial()
+    if isinstance(func_or_task_id, partial):
+        args = func_or_task_id.args + args
+        kwargs.update(func_or_task_id.keywords)
+        func_or_task_id = func_or_task_id.func
+
+    # For instance methods, use the unbound function as the function, and the
+    # "self" argument as the first positional argument
+    if ismethod(func_or_task_id):
+        args = (func_or_task_id.__self__, *args)
+        func_or_task_id = func_or_task_id.__func__
+    elif (
+        isbuiltin(func_or_task_id)
+        and func_or_task_id.__self__ is not None
+        and not ismodule(func_or_task_id.__self__)
+    ):
+        args = (func_or_task_id.__self__, *args)
+        method_class = type(func_or_task_id.__self__)
+        func_or_task_id = getattr(method_class, func_or_task_id.__name__)
+
+    return func_or_task_id, args, kwargs
 
 
 @attrs.define(eq=False, repr=False)
@@ -348,6 +399,41 @@ class AsyncScheduler:
         :return: the created or updated task definition
 
         """
+        task, modified, local_func = await self._resolve_task(
+            func_or_task_id,
+            func=func,
+            job_executor=job_executor,
+            misfire_grace_time=misfire_grace_time,
+            max_running_jobs=max_running_jobs,
+            metadata=metadata,
+        )
+        if callable(local_func):
+            self._task_callables[task.id] = local_func
+
+        if modified:
+            await self.data_store.add_task(task)
+
+        return task
+
+    async def _resolve_task(
+        self,
+        func_or_task_id: TaskType,
+        *,
+        func: Callable[..., Any] | UnsetValue = unset,
+        job_executor: str | UnsetValue = unset,
+        misfire_grace_time: float | timedelta | None | UnsetValue = unset,
+        max_running_jobs: int | None | UnsetValue = unset,
+        metadata: MetadataType | UnsetValue = unset,
+    ) -> tuple[Task, bool, Callable[..., Any] | UnsetValue]:
+        """
+        Resolve a task definition from the given arguments, without writing
+        anything to the data store or registering any local callables.
+
+        :return: a tuple of (the resolved task definition, ``True`` if the task
+            needs to be written to the data store, the local callable or
+            :data:`~apscheduler.UnsetValue.unset`)
+
+        """
         func_ref: str | None = None
         task: Task | None = None
         if callable(func_or_task_id):
@@ -410,7 +496,6 @@ class AsyncScheduler:
         )
 
         if callable(func):
-            self._task_callables[task_params.id] = func
             try:
                 func_ref = callable_to_ref(func)
             except SerializationError:
@@ -450,10 +535,7 @@ class AsyncScheduler:
                 task = attrs.evolve(task, **changes)
                 modified = True
 
-        if modified:
-            await self.data_store.add_task(task)
-
-        return task
+        return task, modified, func
 
     async def get_tasks(self) -> Sequence[Task]:
         """
@@ -513,30 +595,51 @@ class AsyncScheduler:
         schedule_id = id or str(uuid4())
         args = tuple(args or ())
         kwargs = dict(kwargs or {})
-
-        # Unpack the function and positional + keyword arguments from a partial()
-        if isinstance(func_or_task_id, partial):
-            args = func_or_task_id.args + args
-            kwargs.update(func_or_task_id.keywords)
-            func_or_task_id = func_or_task_id.func
-
-        # For instance methods, use the unbound function as the function, and  the
-        # "self" argument as the first positional argument
-        if ismethod(func_or_task_id):
-            args = (func_or_task_id.__self__, *args)
-            func_or_task_id = func_or_task_id.__func__
-        elif (
-            isbuiltin(func_or_task_id)
-            and func_or_task_id.__self__ is not None
-            and not ismodule(func_or_task_id.__self__)
-        ):
-            args = (func_or_task_id.__self__, *args)
-            method_class = type(func_or_task_id.__self__)
-            func_or_task_id = getattr(method_class, func_or_task_id.__name__)
+        func_or_task_id, args, kwargs = _unwrap_callable(func_or_task_id, args, kwargs)
 
         task = await self.configure_task(func_or_task_id)
-        schedule = Schedule(
+        schedule = self._make_schedule(
+            task,
+            trigger,
             id=schedule_id,
+            args=args,
+            kwargs=kwargs,
+            paused=paused,
+            coalesce=coalesce,
+            job_executor=job_executor,
+            misfire_grace_time=misfire_grace_time,
+            metadata=metadata,
+            max_jitter=max_jitter,
+            job_result_expiration_time=job_result_expiration_time,
+        )
+        schedule.next_fire_time = trigger.next()
+        await self.data_store.add_schedule(schedule, conflict_policy)
+        self.logger.info(
+            "Added new schedule (task=%r, trigger=%r); next run time at %s",
+            task.id,
+            trigger,
+            schedule.next_fire_time,
+        )
+        return schedule.id
+
+    def _make_schedule(
+        self,
+        task: Task,
+        trigger: Trigger,
+        *,
+        id: str,
+        args: tuple,
+        kwargs: dict[str, Any],
+        paused: bool,
+        coalesce: CoalescePolicy,
+        job_executor: str | UnsetValue,
+        misfire_grace_time: float | timedelta | None | UnsetValue,
+        metadata: MetadataType | UnsetValue,
+        max_jitter: float | timedelta | None,
+        job_result_expiration_time: float | timedelta,
+    ) -> Schedule:
+        return Schedule(
+            id=id,
             task_id=task.id,
             trigger=trigger,
             args=args,
@@ -553,15 +656,179 @@ class AsyncScheduler:
             job_executor=task.job_executor if job_executor is unset else job_executor,
             job_result_expiration_time=job_result_expiration_time,
         )
-        schedule.next_fire_time = trigger.next()
-        await self.data_store.add_schedule(schedule, conflict_policy)
-        self.logger.info(
-            "Added new schedule (task=%r, trigger=%r); next run time at %s",
-            task.id,
-            trigger,
-            schedule.next_fire_time,
+
+    async def add_schedules(
+        self,
+        schedules: Iterable[Mapping[str, Any]],
+        *,
+        conflict_policy: ConflictPolicy = ConflictPolicy.do_nothing,
+    ) -> list[str]:
+        """
+        Schedule a batch of tasks atomically.
+
+        Either all of the schedules in the batch are added, or none of them are.
+        This includes any task definitions that need to be created: a failed batch
+        will not leave behind any new tasks or modify any existing ones, nor will
+        it replace any existing schedules only partially. Events representing the
+        changes are only published after the batch has been successfully
+        committed, so subscribers never observe intermediate states that could
+        still be rolled back.
+
+        Each entry in ``schedules`` must be a mapping with the following keys
+        (all optional except ``func_or_task_id`` and ``trigger``):
+
+        * ``func_or_task_id``: either a callable or an ID of an existing task
+          definition (same as in :meth:`add_schedule`)
+        * ``trigger``: determines the times when the task should be run
+        * ``id``: an explicit identifier for the schedule (if omitted, a random,
+          UUID based ID will be assigned)
+        * ``args``: positional arguments to be passed to the task function
+        * ``kwargs``: keyword arguments to be passed to the task function
+        * ``paused``: whether the schedule is paused
+        * ``coalesce``: determines what to do when processing the schedule if
+          multiple fire times have become due for this schedule since the last
+          processing
+        * ``job_executor``: name of the job executor to run the scheduled jobs
+          with (overrides the executor specified in the task settings)
+        * ``misfire_grace_time``: maximum number of seconds the scheduled job's
+          actual run time is allowed to be late, compared to the scheduled run
+          time
+        * ``metadata``: key-value pairs for storing JSON compatible custom
+          information
+        * ``max_jitter``: maximum time (in seconds, or as a timedelta) to
+          randomly add to the scheduled time for each job created from this
+          schedule
+        * ``job_result_expiration_time``: minimum time (in seconds, or as a
+          timedelta) to keep the job results in storage from the jobs created by
+          this schedule
+
+        The triggers are only advanced on copies, so the trigger objects passed
+        by the caller are never mutated, even if the batch fails.
+
+        An empty batch is a no-op that simply returns an empty list.
+
+        :param schedules: an iterable of mappings of schedule parameters
+        :param conflict_policy: determines what to do if a schedule with the same
+            ID already exists in the data store
+        :raises ValueError: if the batch contains duplicate schedule IDs,
+            conflicting definitions for the same task, or an entry is missing a
+            required parameter or contains unknown parameters
+        :raises NotImplementedError: if the data store does not support
+            atomically adding batches of schedules
+        :return: the IDs of the schedules in the batch, in the same order
+
+        """
+        self._check_initialized()
+        entries = list(schedules)
+        if not entries:
+            return []
+
+        # Validate and normalize all the entries up front, before advancing any
+        # triggers or writing anything to the data store
+        seen_ids: set[str] = set()
+        normalized: list[dict[str, Any]] = []
+        for index, entry in enumerate(entries, 1):
+            if not isinstance(entry, Mapping):
+                raise TypeError(
+                    f"batch entry #{index}: expected a mapping of schedule "
+                    f"parameters, got {type(entry).__name__!r}"
+                )
+
+            if unknown_keys := set(entry) - _SCHEDULE_ENTRY_KEYS:
+                keys = ", ".join(sorted(unknown_keys))
+                raise ValueError(
+                    f"batch entry #{index}: unknown schedule parameters: {keys}"
+                )
+
+            missing = {"func_or_task_id", "trigger"} - set(entry)
+            if missing:
+                keys = ", ".join(sorted(missing))
+                raise ValueError(
+                    f"batch entry #{index}: missing required parameters: {keys}"
+                )
+
+            if not isinstance(entry["trigger"], Trigger):
+                raise TypeError(
+                    f"batch entry #{index}: 'trigger' must be an instance of "
+                    f"apscheduler.abc.Trigger, got "
+                    f"{type(entry['trigger']).__name__!r}"
+                )
+
+            schedule_id = entry.get("id") or str(uuid4())
+            if schedule_id in seen_ids:
+                raise ValueError(f"duplicate schedule ID in the batch: {schedule_id!r}")
+
+            seen_ids.add(schedule_id)
+            normalized.append({**entry, "id": schedule_id})
+
+        # Resolve the tasks and build the schedules. The triggers are advanced on
+        # copies so that the caller's trigger objects are never mutated, even if
+        # the batch fails partway through.
+        new_schedules: list[Schedule] = []
+        tasks_to_add: dict[str, Task] = {}
+        local_callables: dict[str, Callable[..., Any]] = {}
+        for entry in normalized:
+            func_or_task_id = entry["func_or_task_id"]
+            args = tuple(entry.get("args") or ())
+            kwargs = dict(entry.get("kwargs") or {})
+            func_or_task_id, args, kwargs = _unwrap_callable(
+                func_or_task_id, args, kwargs
+            )
+
+            task, modified, local_func = await self._resolve_task(func_or_task_id)
+            if modified:
+                previous = tasks_to_add.get(task.id)
+                if previous is None:
+                    tasks_to_add[task.id] = task
+                elif (
+                    previous.func != task.func
+                    or previous.job_executor != task.job_executor
+                    or previous.max_running_jobs != task.max_running_jobs
+                    or previous.misfire_grace_time != task.misfire_grace_time
+                    or previous.metadata != task.metadata
+                ):
+                    raise ValueError(
+                        f"conflicting definitions for task {task.id!r} in the "
+                        f"same batch"
+                    )
+
+            if callable(local_func):
+                local_callables[task.id] = local_func
+
+            trigger_copy = deepcopy(entry["trigger"])
+            schedule = self._make_schedule(
+                task,
+                trigger_copy,
+                id=entry["id"],
+                args=args,
+                kwargs=kwargs,
+                paused=entry.get("paused", False),
+                coalesce=entry.get("coalesce", CoalescePolicy.latest),
+                job_executor=entry.get("job_executor", unset),
+                misfire_grace_time=entry.get("misfire_grace_time", unset),
+                metadata=entry.get("metadata", unset),
+                max_jitter=entry.get("max_jitter"),
+                job_result_expiration_time=entry.get("job_result_expiration_time", 0),
+            )
+            schedule.next_fire_time = trigger_copy.next()
+            new_schedules.append(schedule)
+
+        await self.data_store.add_schedules(
+            new_schedules, conflict_policy, tasks=list(tasks_to_add.values())
         )
-        return schedule.id
+
+        # Only register the local callables once the batch has been committed
+        self._task_callables.update(local_callables)
+        self.logger.info(
+            "Added a batch of %d schedules: %s",
+            len(new_schedules),
+            ", ".join(
+                f"{schedule.id} (task={schedule.task_id!r}, next run at "
+                f"{schedule.next_fire_time})"
+                for schedule in new_schedules
+            ),
+        )
+        return [schedule.id for schedule in new_schedules]
 
     async def get_schedule(self, id: str) -> Schedule:
         """

@@ -32,6 +32,8 @@ from pytest_mock import MockerFixture, MockFixture
 from apscheduler import (
     AsyncScheduler,
     CoalescePolicy,
+    ConflictingIdError,
+    ConflictPolicy,
     Event,
     Job,
     JobAcquired,
@@ -48,6 +50,7 @@ from apscheduler import (
     SchedulerStarted,
     SchedulerStopped,
     ScheduleUpdated,
+    Task,
     TaskAdded,
     TaskDefaults,
     TaskUpdated,
@@ -304,6 +307,316 @@ class TestAsyncScheduler:
                 assert event.schedule_id == "foo"
                 assert event.task_id == f"{__name__}:dummy_async_job"
                 assert not event.finished
+
+    async def test_add_schedules_empty_batch(self) -> None:
+        async with AsyncScheduler() as scheduler:
+            assert await scheduler.add_schedules([]) == []
+            assert await scheduler.get_schedules() == []
+
+    async def test_add_schedules(self, raw_datastore: DataStore) -> None:
+        if type(raw_datastore).add_schedules is DataStore.add_schedules:
+            pytest.skip("the data store does not support batch schedule addition")
+
+        send, receive = create_memory_object_stream[Event](4)
+        with send, receive:
+            async with AsyncScheduler(data_store=raw_datastore) as scheduler:
+                scheduler.subscribe(send.send)
+                run_time = datetime(2030, 1, 1, tzinfo=UTC)
+                ids = await scheduler.add_schedules(
+                    [
+                        {
+                            "func_or_task_id": dummy_async_job,
+                            "trigger": DateTrigger(run_time),
+                            "id": "first",
+                        },
+                        {
+                            "func_or_task_id": "other_task",
+                            "trigger": DateTrigger(run_time),
+                            "id": "second",
+                            "args": [1],
+                            "kwargs": {"fail": False},
+                        },
+                    ],
+                    conflict_policy=ConflictPolicy.exception,
+                )
+                assert ids == ["first", "second"]
+
+                schedules = await scheduler.get_schedules()
+                assert {schedule.id for schedule in schedules} == {"first", "second"}
+                tasks = await scheduler.get_tasks()
+                assert {task.id for task in tasks} == {
+                    f"{__name__}:dummy_async_job",
+                    "other_task",
+                }
+
+            with fail_after(3):
+                events = [await receive.receive() for _ in range(4)]
+
+            task_events = [event for event in events if isinstance(event, TaskAdded)]
+            schedule_events = [
+                event for event in events if isinstance(event, ScheduleAdded)
+            ]
+            assert {event.task_id for event in task_events} == {
+                f"{__name__}:dummy_async_job",
+                "other_task",
+            }
+            assert {event.schedule_id for event in schedule_events} == {
+                "first",
+                "second",
+            }
+
+    async def test_add_schedules_trigger_not_advanced(self) -> None:
+        async with AsyncScheduler() as scheduler:
+            run_time = datetime(2030, 1, 1, tzinfo=UTC)
+            trigger = DateTrigger(run_time)
+            await scheduler.add_schedules(
+                [{"func_or_task_id": dummy_async_job, "trigger": trigger}]
+            )
+
+            # The caller's trigger object must not have been advanced
+            assert trigger.next() == run_time
+
+    async def test_add_schedules_trigger_failure(self) -> None:
+        class FailingTrigger(DateTrigger):
+            def next(self) -> datetime | None:
+                raise RuntimeError("trigger failure")
+
+        async with AsyncScheduler() as scheduler:
+            run_time = datetime(2030, 1, 1, tzinfo=UTC)
+            good_trigger = DateTrigger(run_time)
+            with pytest.raises(RuntimeError, match="trigger failure"):
+                await scheduler.add_schedules(
+                    [
+                        {
+                            "func_or_task_id": "task1",
+                            "trigger": good_trigger,
+                            "id": "s1",
+                        },
+                        {
+                            "func_or_task_id": "task2",
+                            "trigger": FailingTrigger(run_time),
+                            "id": "s2",
+                        },
+                    ]
+                )
+
+            # Nothing may have been stored, and the other trigger must not have
+            # been advanced either
+            assert await scheduler.get_schedules() == []
+            assert await scheduler.get_tasks() == []
+            assert good_trigger.next() == run_time
+
+    async def test_add_schedules_duplicate_ids(self) -> None:
+        async with AsyncScheduler() as scheduler:
+            trigger = DateTrigger(datetime(2030, 1, 1, tzinfo=UTC))
+            with pytest.raises(ValueError, match="duplicate schedule ID"):
+                await scheduler.add_schedules(
+                    [
+                        {
+                            "func_or_task_id": dummy_async_job,
+                            "trigger": trigger,
+                            "id": "dup",
+                        },
+                        {
+                            "func_or_task_id": dummy_async_job,
+                            "trigger": trigger,
+                            "id": "dup",
+                        },
+                    ]
+                )
+
+            assert await scheduler.get_schedules() == []
+            assert await scheduler.get_tasks() == []
+
+    async def test_add_schedules_invalid_entries(self) -> None:
+        async with AsyncScheduler() as scheduler:
+            trigger = DateTrigger(datetime(2030, 1, 1, tzinfo=UTC))
+
+            # Missing required parameter
+            with pytest.raises(ValueError, match="missing required parameters"):
+                await scheduler.add_schedules([{"func_or_task_id": dummy_async_job}])
+
+            # Unknown parameter
+            with pytest.raises(ValueError, match="unknown schedule parameters: bogus"):
+                await scheduler.add_schedules(
+                    [
+                        {
+                            "func_or_task_id": dummy_async_job,
+                            "trigger": trigger,
+                            "bogus": 1,
+                        }
+                    ]
+                )
+
+            # Not a mapping
+            with pytest.raises(TypeError, match="expected a mapping"):
+                await scheduler.add_schedules(["not a mapping"])
+
+            # Not a trigger
+            with pytest.raises(TypeError, match="'trigger' must be an instance"):
+                await scheduler.add_schedules(
+                    [{"func_or_task_id": dummy_async_job, "trigger": "not a trigger"}]
+                )
+
+            assert await scheduler.get_schedules() == []
+            assert await scheduler.get_tasks() == []
+
+    async def test_add_schedules_conflicting_task_definitions(self) -> None:
+        async with AsyncScheduler() as scheduler:
+            trigger = DateTrigger(datetime(2030, 1, 1, tzinfo=UTC))
+            task1 = Task(
+                id="shared", func=None, job_executor="async", max_running_jobs=1
+            )
+            task2 = Task(
+                id="shared", func=None, job_executor="async", max_running_jobs=2
+            )
+            with pytest.raises(ValueError, match="conflicting definitions for task"):
+                await scheduler.add_schedules(
+                    [
+                        {"func_or_task_id": task1, "trigger": trigger, "id": "s1"},
+                        {"func_or_task_id": task2, "trigger": trigger, "id": "s2"},
+                    ]
+                )
+
+            assert await scheduler.get_schedules() == []
+            assert await scheduler.get_tasks() == []
+
+    async def test_add_schedules_shared_task(self) -> None:
+        async with AsyncScheduler() as scheduler:
+            trigger = DateTrigger(datetime(2030, 1, 1, tzinfo=UTC))
+            ids = await scheduler.add_schedules(
+                [
+                    {"func_or_task_id": "shared_task", "trigger": trigger, "id": "s1"},
+                    {"func_or_task_id": "shared_task", "trigger": trigger, "id": "s2"},
+                ],
+                conflict_policy=ConflictPolicy.exception,
+            )
+            assert ids == ["s1", "s2"]
+
+            # The shared task must only have been added once
+            tasks = await scheduler.get_tasks()
+            assert [task.id for task in tasks] == ["shared_task"]
+
+    @pytest.mark.parametrize(
+        "conflict_policy", [ConflictPolicy.replace, ConflictPolicy.do_nothing]
+    )
+    async def test_add_schedules_conflict_policy(
+        self, conflict_policy: ConflictPolicy
+    ) -> None:
+        async with AsyncScheduler() as scheduler:
+            first_run = datetime(2030, 1, 1, tzinfo=UTC)
+            new_run = datetime(2031, 1, 1, tzinfo=UTC)
+            await scheduler.add_schedule(
+                dummy_async_job, DateTrigger(first_run), id="existing"
+            )
+            ids = await scheduler.add_schedules(
+                [
+                    {
+                        "func_or_task_id": dummy_async_job,
+                        "trigger": DateTrigger(new_run),
+                        "id": "existing",
+                    }
+                ],
+                conflict_policy=conflict_policy,
+            )
+            assert ids == ["existing"]
+
+            schedule = await scheduler.get_schedule("existing")
+            if conflict_policy is ConflictPolicy.replace:
+                assert schedule.next_fire_time == new_run
+            else:
+                assert schedule.next_fire_time == first_run
+
+    async def test_add_schedules_conflict_exception(self) -> None:
+        async with AsyncScheduler() as scheduler:
+            first_run = datetime(2030, 1, 1, tzinfo=UTC)
+            await scheduler.add_schedule(
+                dummy_async_job, DateTrigger(first_run), id="existing"
+            )
+            with pytest.raises(ConflictingIdError):
+                await scheduler.add_schedules(
+                    [
+                        {
+                            "func_or_task_id": "new_task",
+                            "trigger": DateTrigger(datetime(2031, 1, 1, tzinfo=UTC)),
+                            "id": "existing",
+                        },
+                        {
+                            "func_or_task_id": "new_task2",
+                            "trigger": DateTrigger(datetime(2031, 1, 1, tzinfo=UTC)),
+                            "id": "brand_new",
+                        },
+                    ],
+                    conflict_policy=ConflictPolicy.exception,
+                )
+
+            # The failed batch must not have added or modified anything
+            schedules = await scheduler.get_schedules()
+            assert [schedule.id for schedule in schedules] == ["existing"]
+            assert schedules[0].next_fire_time == first_run
+            tasks = await scheduler.get_tasks()
+            assert [task.id for task in tasks] == [f"{__name__}:dummy_async_job"]
+
+    async def test_add_schedules_data_store_failure(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        async def failing_add_schedules(
+            self: DataStore,
+            schedules: list,
+            conflict_policy: ConflictPolicy,
+            *,
+            tasks: list | None = None,
+        ) -> None:
+            raise RuntimeError("database is gone")
+
+        monkeypatch.setattr(MemoryDataStore, "add_schedules", failing_add_schedules)
+        events: list[Event] = []
+        async with AsyncScheduler() as scheduler:
+            scheduler.subscribe(events.append)
+            with pytest.raises(RuntimeError, match="database is gone"):
+                await scheduler.add_schedules(
+                    [
+                        {
+                            "func_or_task_id": dummy_async_job,
+                            "trigger": DateTrigger(datetime(2030, 1, 1, tzinfo=UTC)),
+                            "id": "s1",
+                        }
+                    ]
+                )
+
+            # The failed batch must not have left anything behind, and no events
+            # may have been published for it
+            assert await scheduler.get_schedules() == []
+            assert await scheduler.get_tasks() == []
+            await sleep(0.1)
+            assert events == []
+
+    async def test_add_schedules_unsupported_data_store(self) -> None:
+        class NonAtomicDataStore(MemoryDataStore):
+            async def add_schedules(
+                self,
+                schedules: list,
+                conflict_policy: ConflictPolicy,
+                *,
+                tasks: list | None = None,
+            ) -> None:
+                raise NotImplementedError("not supported")
+
+        async with AsyncScheduler(data_store=NonAtomicDataStore()) as scheduler:
+            with pytest.raises(NotImplementedError, match="not supported"):
+                await scheduler.add_schedules(
+                    [
+                        {
+                            "func_or_task_id": dummy_async_job,
+                            "trigger": DateTrigger(datetime(2030, 1, 1, tzinfo=UTC)),
+                        }
+                    ]
+                )
+
+            # The scheduler must not emulate atomicity by adding the schedules
+            # one by one
+            assert await scheduler.get_schedules() == []
+            assert await scheduler.get_tasks() == []
 
     async def test_add_job_wait_result(self, raw_datastore: DataStore) -> None:
         send, receive = create_memory_object_stream[Event](2)
@@ -1411,6 +1724,69 @@ class TestSyncScheduler:
         assert isinstance(event, ScheduleRemoved)
         assert event.schedule_id == "foo"
         assert not event.finished
+
+    def test_add_schedules(self, timezone: ZoneInfo) -> None:
+        queue: Queue[Event] = Queue()
+        with Scheduler() as scheduler:
+            scheduler.subscribe(queue.put_nowait)
+            now = datetime.now(timezone)
+            ids = scheduler.add_schedules(
+                [
+                    {
+                        "func_or_task_id": dummy_sync_job,
+                        "trigger": DateTrigger(now),
+                        "id": "first",
+                    },
+                    {
+                        "func_or_task_id": "other_task",
+                        "trigger": DateTrigger(now),
+                        "id": "second",
+                    },
+                ],
+                conflict_policy=ConflictPolicy.exception,
+            )
+            assert ids == ["first", "second"]
+
+            schedules = scheduler.get_schedules()
+            assert {schedule.id for schedule in schedules} == {"first", "second"}
+            tasks = scheduler.get_tasks()
+            assert {task.id for task in tasks} == {
+                f"{__name__}:dummy_sync_job",
+                "other_task",
+            }
+
+            # An empty batch is a no-op
+            assert scheduler.add_schedules([]) == []
+
+            # Duplicate IDs within a batch are rejected before anything is stored
+            with pytest.raises(ValueError, match="duplicate schedule ID"):
+                scheduler.add_schedules(
+                    [
+                        {
+                            "func_or_task_id": dummy_sync_job,
+                            "trigger": DateTrigger(now),
+                            "id": "dup",
+                        },
+                        {
+                            "func_or_task_id": dummy_sync_job,
+                            "trigger": DateTrigger(now),
+                            "id": "dup",
+                        },
+                    ]
+                )
+
+            assert len(scheduler.get_schedules()) == 2
+
+        received_events: list[Event] = []
+        while not queue.empty():
+            received_events.append(queue.get_nowait())
+
+        added_schedules = {
+            event.schedule_id
+            for event in received_events
+            if isinstance(event, ScheduleAdded)
+        }
+        assert added_schedules == {"first", "second"}
 
     def test_add_job_wait_result(self) -> None:
         queue: Queue[Event] = Queue()

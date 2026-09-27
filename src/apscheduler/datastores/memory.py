@@ -12,6 +12,7 @@ import attrs
 from .. import JobOutcome
 from .._enums import ConflictPolicy
 from .._events import (
+    DataStoreEvent,
     JobAcquired,
     JobAdded,
     JobReleased,
@@ -126,6 +127,78 @@ class MemoryDataStore(BaseDataStore):
             )
 
         await self._event_broker.publish(event)
+
+    async def add_schedules(
+        self,
+        schedules: Sequence[Schedule],
+        conflict_policy: ConflictPolicy,
+        *,
+        tasks: Sequence[Task] = (),
+    ) -> None:
+        schedule_ids = [schedule.id for schedule in schedules]
+        if len(set(schedule_ids)) != len(schedule_ids):
+            raise ValueError("The batch contains duplicate schedule IDs")
+
+        # Compute all the changes on copies of the internal state first, so that a
+        # failure at any point leaves the actual state untouched
+        new_tasks = dict(self._tasks)
+        new_schedules = list(self._schedules)
+        new_schedules_by_id = dict(self._schedules_by_id)
+        new_schedules_by_task_id: dict[str, set[Schedule]] = defaultdict(
+            set, {key: set(value) for key, value in self._schedules_by_task_id.items()}
+        )
+        events: list[DataStoreEvent] = []
+
+        for task in tasks:
+            if task.id in new_tasks:
+                task.running_jobs = new_tasks[task.id].running_jobs
+                new_tasks[task.id] = task
+                events.append(TaskUpdated(task_id=task.id))
+            else:
+                new_tasks[task.id] = task
+                events.append(TaskAdded(task_id=task.id))
+
+        for schedule in schedules:
+            old_schedule = new_schedules_by_id.get(schedule.id)
+            if old_schedule is not None:
+                if conflict_policy is ConflictPolicy.do_nothing:
+                    continue
+                elif conflict_policy is ConflictPolicy.exception:
+                    raise ConflictingIdError(schedule.id)
+
+                left_index = bisect_left(new_schedules, old_schedule)
+                right_index = bisect_right(new_schedules, old_schedule)
+                index = new_schedules.index(old_schedule, left_index, right_index + 1)
+                del new_schedules[index]
+                new_schedules_by_task_id[old_schedule.task_id].discard(old_schedule)
+
+            new_schedules_by_id[schedule.id] = schedule
+            new_schedules_by_task_id[schedule.task_id].add(schedule)
+            insort_right(new_schedules, schedule)
+
+            event: ScheduleUpdated | ScheduleAdded
+            if old_schedule is not None:
+                event = ScheduleUpdated(
+                    schedule_id=schedule.id,
+                    task_id=schedule.task_id,
+                    next_fire_time=schedule.next_fire_time,
+                )
+            else:
+                event = ScheduleAdded(
+                    schedule_id=schedule.id,
+                    task_id=schedule.task_id,
+                    next_fire_time=schedule.next_fire_time,
+                )
+
+            events.append(event)
+
+        # Swap in the new state atomically, then publish the events
+        self._tasks = new_tasks
+        self._schedules = new_schedules
+        self._schedules_by_id = new_schedules_by_id
+        self._schedules_by_task_id = new_schedules_by_task_id
+        for event in events:
+            await self._event_broker.publish(event)
 
     async def remove_schedules(
         self, ids: Iterable[str], *, finished: bool = False

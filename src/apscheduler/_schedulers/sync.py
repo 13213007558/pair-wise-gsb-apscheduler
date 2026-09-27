@@ -304,6 +304,21 @@ class Scheduler:
         portal = self._ensure_services_ready()
         return portal.call(self._async_scheduler.get_schedule, id)
 
+    def add_schedules(
+        self,
+        schedules: Iterable[Mapping[str, Any]],
+        *,
+        conflict_policy: ConflictPolicy = ConflictPolicy.do_nothing,
+    ) -> list[str]:
+        portal = self._ensure_services_ready()
+        return portal.call(
+            partial(
+                self._async_scheduler.add_schedules,
+                schedules,
+                conflict_policy=conflict_policy,
+            )
+        )
+
     def get_schedules(self) -> list[Schedule]:
         portal = self._ensure_services_ready()
         return portal.call(self._async_scheduler.get_schedules)

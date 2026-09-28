@@ -30,6 +30,7 @@ from apscheduler.events import (
     JobSubmissionEvent,
     SchedulerEvent,
 )
+from apscheduler.eventstream import AsyncEventStream, OverflowPolicy
 from apscheduler.executors.base import BaseExecutor, MaxInstancesReachedError
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.job import Job
@@ -120,6 +121,8 @@ class BaseScheduler(metaclass=ABCMeta):
         self._jobstores_lock = self._create_lock()
         self._listeners = []
         self._listeners_lock = self._create_lock()
+        self._event_streams = []
+        self._event_streams_lock = self._create_lock()
         self._pending_jobs = []
         self.state = STATE_STOPPED
         self.configure(gconfig, **options)
@@ -244,6 +247,10 @@ class BaseScheduler(metaclass=ABCMeta):
 
         self._logger.info("Scheduler has been shut down")
         self._dispatch_event(SchedulerEvent(EVENT_SCHEDULER_SHUTDOWN))
+        # Boundary: events up to and including EVENT_SCHEDULER_SHUTDOWN have
+        # been queued to event stream subscribers; nothing is published after
+        # this point and subscribers may drain their buffers.
+        self._close_event_streams()
 
     def pause(self):
         """
@@ -419,6 +426,65 @@ class BaseScheduler(metaclass=ABCMeta):
             for i, (cb, _) in enumerate(self._listeners):
                 if callback == cb:
                     del self._listeners[i]
+
+    def add_event_stream(
+        self, mask=EVENT_ALL, capacity=100, overflow=OverflowPolicy.DROP_NEWEST
+    ):
+        """
+        add_event_stream(mask=EVENT_ALL, capacity=100, overflow=OverflowPolicy.DROP_NEWEST)
+
+        Adds a bounded, asynchronous event stream subscriber and returns it.
+
+        Unlike synchronous listeners (see :meth:`add_listener`), events are
+        snapshotted and queued into a per-subscriber bounded buffer without
+        ever blocking the scheduler's main loop. The subscriber consumes the
+        events asynchronously::
+
+            stream = scheduler.add_event_stream(capacity=1000)
+            async for event in stream:
+                ...
+
+        Events concerning the same job are delivered in publication order.
+        When the buffer is full, the `overflow` policy decides whether the
+        incoming event is dropped, the oldest queued event is evicted, or
+        consecutive events of the same job are coalesced; every outcome is
+        recorded in the stream's `stats`. A slow subscriber therefore never
+        slows down the scheduler or other subscribers, and memory usage stays
+        bounded by `capacity`.
+
+        All streams are closed (with drain) when the scheduler is shut down:
+        events dispatched up to and including the `EVENT_SCHEDULER_SHUTDOWN`
+        event remain available to the subscriber, and no events are published
+        afterwards. Pausing the scheduler does not close streams; events from
+        already running jobs keep flowing while paused.
+
+        :param int mask: bitmask that indicates which events should be
+            streamed to the subscriber
+        :param int capacity: maximum number of buffered events per subscriber
+        :param OverflowPolicy overflow: policy applied when the buffer is full
+        :return: the created event stream
+        :rtype: apscheduler.eventstream.AsyncEventStream
+
+        .. seealso:: :mod:`apscheduler.eventstream`
+
+        """
+        stream = AsyncEventStream(mask=mask, capacity=capacity, overflow=overflow)
+        with self._event_streams_lock:
+            self._event_streams.append(stream)
+        return stream
+
+    def remove_event_stream(self, stream, drain=True):
+        """
+        Removes a previously added event stream subscriber.
+
+        The stream is closed (draining its buffered events by default) so the
+        subscriber can observe the terminal state. Only this subscriber is
+        affected.
+        """
+        with self._event_streams_lock:
+            if stream in self._event_streams:
+                self._event_streams.remove(stream)
+        stream.close(drain=drain)
 
     def add_job(
         self,
@@ -1038,6 +1104,49 @@ class BaseScheduler(metaclass=ABCMeta):
                     cb(event)
                 except BaseException:
                     self._logger.exception("Error notifying listener")
+
+        self._publish_event_streams(event)
+
+    def _publish_event_streams(self, event):
+        """
+        Publishes the event to all registered asynchronous event streams.
+
+        Publishing never blocks the caller: each stream has its own bounded
+        buffer and applies its overflow policy when full. A stream that fails
+        unexpectedly is removed from the registry without affecting any other
+        subscriber.
+        """
+        with self._event_streams_lock:
+            streams = tuple(self._event_streams)
+
+        failed = []
+        for stream in streams:
+            if stream.matches(event.code):
+                try:
+                    stream.publish(event)
+                except BaseException:
+                    self._logger.exception(
+                        "Error publishing event to stream %r; removing it", stream
+                    )
+                    failed.append(stream)
+
+        if failed:
+            with self._event_streams_lock:
+                for stream in failed:
+                    if stream in self._event_streams:
+                        self._event_streams.remove(stream)
+
+    def _close_event_streams(self):
+        """
+        Closes all registered event streams (with drain), marking the boundary
+        after which no further events are published to them.
+        """
+        with self._event_streams_lock:
+            streams = tuple(self._event_streams)
+            del self._event_streams[:]
+
+        for stream in streams:
+            stream.close(drain=True)
 
     def _check_uwsgi(self):
         """Check if we're running under uWSGI with threads disabled."""

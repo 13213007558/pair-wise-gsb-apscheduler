@@ -457,6 +457,45 @@ Example::
 
     scheduler.add_listener(my_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
 
+.. _scheduler-event-streams:
+
+Asynchronous event streams
+--------------------------
+
+In addition to synchronous listeners, the scheduler can publish events to bounded,
+asynchronous event streams via
+:meth:`~apscheduler.schedulers.base.BaseScheduler.add_event_stream`. Each subscriber
+gets its own bounded buffer, so a slow or blocked subscriber can never stall the
+scheduler's main loop or other subscribers, and memory usage stays bounded::
+
+    stream = scheduler.add_event_stream(
+        EVENT_JOB_SUBMITTED | EVENT_JOB_EXECUTED | EVENT_JOB_ERROR,
+        capacity=1000,
+        overflow=OverflowPolicy.DROP_OLDEST,
+    )
+
+    async for event in stream:
+        print('Got event:', event)
+
+Key properties:
+
+* events concerning the same job are always delivered in publication order
+* events are snapshotted before being queued, so later mutations of an event
+  object by a publisher never affect already queued events
+* when the buffer is full, the chosen
+  :class:`~apscheduler.eventstream.OverflowPolicy` drops the incoming event,
+  evicts the oldest queued event, or coalesces consecutive events of the same
+  job; every outcome is recorded in the stream's
+  :attr:`~apscheduler.eventstream.AsyncEventStream.stats`
+* closing the stream (or shutting down the scheduler) lets the subscriber drain
+  the remaining buffered events before :exc:`anyio.EndOfStream` is raised;
+  cancelling it raises :exc:`~apscheduler.eventstream.EventStreamCancelled`
+* when the scheduler is shut down, all events up to and including
+  `EVENT_SCHEDULER_SHUTDOWN` remain available for draining, and no events are
+  published to the streams afterwards; pausing the scheduler does not close the
+  streams
+
+See the :mod:`~apscheduler.eventstream` module documentation for details.
 
 Exporting and importing jobs
 ----------------------------

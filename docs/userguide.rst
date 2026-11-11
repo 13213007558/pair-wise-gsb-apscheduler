@@ -627,6 +627,26 @@ built-in alternatives are:
 The former requires the cbor2_ library, but supports a wider variety of types natively.
 The latter has no dependencies but has very limited support for different types.
 
+.. warning:: Both the CBOR and JSON serializers restore objects by importing the
+    class named in the serialized data. Only use their default (trusted) mode with
+    data stores whose contents cannot be tampered with. When the serialized data
+    passes through another service, configure :class:`~serializers.json.JSONSerializer`
+    in restricted mode by setting ``restricted=True`` and registering every type (via
+    ``allowed_types``) or restore callable (via ``factories``) that may appear in the
+    data. Any unregistered reference is then rejected before its module is imported or
+    any object is constructed, including references nested inside another object's
+    state. The serializer never silently falls back to importing an unregistered type::
+
+        from apscheduler.serializers.json import JSONSerializer
+        from apscheduler.triggers.date import DateTrigger
+        from apscheduler.triggers.interval import IntervalTrigger
+
+        serializer = JSONSerializer(
+            restricted=True,
+            allowed_types=(DateTrigger, IntervalTrigger),
+            factories={"myapp:rebuild_custom_trigger": rebuild_custom_trigger},
+        )
+
 The third point relates to situations where you're essentially adding the same schedule
 to the data store over and over again. If you don't specify a static identifier for
 the schedules added at the start of the application, you will end up with an increasing

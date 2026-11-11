@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import tzinfo
 from functools import partial
 from inspect import isclass, ismethod, ismethoddescriptor
@@ -8,6 +10,13 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ._exceptions import DeserializationError, SerializationError
+
+#: When this variable holds a registry, ``unmarshal_object`` operates in the
+#: restricted mode and only restores references found in the registry, without
+#: ever importing the module named in the reference.
+_unmarshal_registry: ContextVar[Mapping[str, Callable[..., Any]] | None] = (
+    ContextVar("unmarshal_registry", default=None)
+)
 
 
 def marshal_object(obj) -> tuple[str, Any]:
@@ -17,7 +26,86 @@ def marshal_object(obj) -> tuple[str, Any]:
     )
 
 
+def build_type_registry(
+    allowed_types: Iterable[type] = (),
+    factories: Mapping[str, Callable[..., Any]] | None = None,
+) -> dict[str, Callable[..., Any]]:
+    """
+    Build a mapping of ``"module:qualname"`` references to their restore callables.
+
+    Each class in ``allowed_types`` is registered under its own reference and restored
+    using the default mechanism (``cls.__new__`` followed by ``__setstate__``).
+    Each entry in ``factories`` maps a reference to a callable that receives the
+    marshalled state and returns the restored object.
+
+    :raises ValueError: if two entries resolve to the same reference, or a class in
+        ``allowed_types`` lacks the ``__module__`` / ``__qualname__`` attributes
+
+    """
+    registry: dict[str, Callable[..., Any]] = {}
+    for cls in allowed_types:
+        if not isinstance(cls, type):
+            raise TypeError(f"allowed_types entries must be classes, got {cls!r}")
+        if not hasattr(cls, "__module__") or not hasattr(cls, "__qualname__"):
+            raise ValueError(f"Class {cls!r} has no module or qualname")
+
+        ref = f"{cls.__module__}:{cls.__qualname__}"
+        if ref in registry:
+            raise ValueError(f"Duplicate registration for reference {ref!r}")
+
+        registry[ref] = cls
+
+    for ref, factory in (factories or {}).items():
+        if not isinstance(ref, str) or ":" not in ref:
+            raise ValueError(f"Invalid reference used as factory key: {ref!r}")
+        if not callable(factory):
+            raise TypeError(f"Factory for {ref!r} is not callable")
+        if ref in registry:
+            raise ValueError(f"Duplicate registration for reference {ref!r}")
+
+        registry[ref] = factory
+
+    return registry
+
+
+@contextmanager
+def restricted_unmarshalling(
+    registry: Mapping[str, Callable[..., Any]],
+) -> Iterator[None]:
+    """
+    Run the enclosed code with ``unmarshal_object`` restricted to ``registry``.
+
+    Any reference not present in the registry is rejected with
+    :class:`~apscheduler.DeserializationError` before its module is imported or any
+    object is constructed. The restriction also applies to objects restored
+    transitively while another object's ``__setstate__`` runs, so nested objects cannot
+    bypass it.
+
+    """
+    token = _unmarshal_registry.set(dict(registry))
+    try:
+        yield
+    finally:
+        _unmarshal_registry.reset(token)
+
+
 def unmarshal_object(ref: str, state: Any) -> Any:
+    registry = _unmarshal_registry.get()
+    if registry is not None:
+        restore = registry.get(ref)
+        if restore is None:
+            raise DeserializationError(
+                f"Refusing to restore unregistered type reference {ref!r}: the "
+                f"reference is not in the serializer's allowed types"
+            )
+
+        if isinstance(restore, type):
+            instance = restore.__new__(restore)
+            instance.__setstate__(state)
+            return instance
+
+        return restore(state)
+
     cls = callable_from_ref(ref)
     if not isinstance(cls, type):
         raise TypeError(f"{ref} is not a class")

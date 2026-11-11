@@ -6,6 +6,10 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **UNRELEASED**
 
+- Added an opt-in restricted mode to ``JSONSerializer`` (``restricted=True``) that only
+  restores types registered via ``allowed_types`` or ``factories``; unregistered
+  references are rejected before their module is imported or any object is constructed,
+  including nested references, instead of being trusted implicitly
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+

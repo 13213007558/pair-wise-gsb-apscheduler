@@ -934,11 +934,19 @@ class AsyncScheduler:
                 wakeup_event.set()
 
         async def extend_schedule_leases(schedules: Sequence[Schedule]) -> None:
-            schedule_ids = {schedule.id for schedule in schedules}
+            schedule_tokens = {
+                schedule.id: schedule.acquisition_token
+                for schedule in schedules
+                if schedule.acquisition_token is not None
+            }
+            schedule_ids = set(schedule_tokens)
             while True:
                 await sleep(self.lease_duration.total_seconds() / 2)
                 await self.data_store.extend_acquired_schedule_leases(
-                    self.identity, schedule_ids, self.lease_duration
+                    self.identity,
+                    schedule_ids,
+                    self.lease_duration,
+                    schedule_tokens,
                 )
 
         subscription = self.event_broker.subscribe(
@@ -1058,7 +1066,14 @@ class AsyncScheduler:
                         )
 
                 # Update the schedules (and release the scheduler's claim on them)
-                await self.data_store.release_schedules(self.identity, results)
+                schedule_tokens = {
+                    schedule.id: schedule.acquisition_token
+                    for schedule in schedules
+                    if schedule.acquisition_token is not None
+                }
+                await self.data_store.release_schedules(
+                    self.identity, results, schedule_tokens
+                )
 
                 # If we received fewer schedules than the maximum amount, sleep
                 # until the next schedule is due or the scheduler is explicitly
@@ -1116,9 +1131,16 @@ class AsyncScheduler:
         async def extend_job_leases() -> None:
             while self._state in (RunState.starting, RunState.started):
                 await sleep(self.lease_duration.total_seconds() / 2)
-                if job_ids := {job.id for job in self._running_jobs}:
+                if job_tokens := {
+                    job.id: job.acquisition_token
+                    for job in self._running_jobs
+                    if job.acquisition_token is not None
+                }:
                     await self.data_store.extend_acquired_job_leases(
-                        self.identity, job_ids, self.lease_duration
+                        self.identity,
+                        set(job_tokens),
+                        self.lease_duration,
+                        job_tokens,
                     )
 
         # If there are any jobs marked as being acquired by this scheduler, release them
@@ -1179,7 +1201,9 @@ class AsyncScheduler:
                 result = JobResult.from_job(
                     job, JobOutcome.missed_start_deadline, finished_at=start_time
                 )
-                await self.data_store.release_job(self.identity, job, result)
+                await self.data_store.release_job(
+                    self.identity, job, result, job.acquisition_token
+                )
                 return
 
             try:
@@ -1196,7 +1220,9 @@ class AsyncScheduler:
                     result = JobResult.from_job(
                         job, JobOutcome.cancelled, started_at=start_time
                     )
-                    await self.data_store.release_job(self.identity, job, result)
+                    await self.data_store.release_job(
+                        self.identity, job, result, job.acquisition_token
+                    )
             except BaseException as exc:
                 if isinstance(exc, Exception):
                     self.logger.exception("Job %s raised an exception", job.id)
@@ -1211,7 +1237,9 @@ class AsyncScheduler:
                     started_at=start_time,
                     exception=exc,
                 )
-                await self.data_store.release_job(self.identity, job, result)
+                await self.data_store.release_job(
+                    self.identity, job, result, job.acquisition_token
+                )
                 if not isinstance(exc, Exception):
                     raise
             else:
@@ -1222,7 +1250,9 @@ class AsyncScheduler:
                     started_at=start_time,
                     return_value=retval,
                 )
-                await self.data_store.release_job(self.identity, job, result)
+                await self.data_store.release_job(
+                    self.identity, job, result, job.acquisition_token
+                )
             finally:
                 current_job.reset(token)
         finally:

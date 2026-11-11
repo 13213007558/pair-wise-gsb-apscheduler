@@ -34,6 +34,7 @@ from sqlalchemy import (
     bindparam,
     create_engine,
     false,
+    func,
     or_,
     select,
 )
@@ -130,6 +131,7 @@ class _JobDiscard:
     schedule_id: str | None
     scheduled_fire_time: datetime | None
     result_expires_at: datetime
+    acquisition_token: int | None
     exception: Exception | None = None
 
 
@@ -361,6 +363,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
             *next_fire_time_tzoffset_columns,
             Column("acquired_by", Unicode(500), index=True),
             Column("acquired_until", timestamp_type),
+            Column("acquisition_token", BigInteger),
         )
         Table(
             "jobs",
@@ -379,6 +382,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
             Column("created_at", timestamp_type, nullable=False, index=True),
             Column("acquired_by", Unicode(500), index=True),
             Column("acquired_until", timestamp_type),
+            Column("acquisition_token", BigInteger),
         )
         Table(
             "job_results",
@@ -682,15 +686,27 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     update = (
                         self._t_schedules.update()
                         .where(self._t_schedules.c.id.in_(subselect))
-                        .values(acquired_by=scheduler_id, acquired_until=acquired_until)
+                        .values(
+                            acquired_by=scheduler_id,
+                            acquired_until=acquired_until,
+                            acquisition_token=func.coalesce(
+                                self._t_schedules.c.acquisition_token, 0
+                            )
+                            + 1,
+                        )
                     )
                     if self._supports_update_returning:
                         update = update.returning(*self._t_schedules.columns)
                         result = await self._execute(conn, update)
                     else:
                         await self._execute(conn, update)
+                        # Restrict the read-back to the schedules that were part of
+                        # this acquisition batch
                         query = self._t_schedules.select().where(
-                            and_(self._t_schedules.c.acquired_by == scheduler_id)
+                            and_(
+                                self._t_schedules.c.id.in_(subselect),
+                                self._t_schedules.c.acquired_by == scheduler_id,
+                            )
                         )
                         result = await self._execute(conn, query)
 
@@ -699,7 +715,10 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         return schedules
 
     async def release_schedules(
-        self, scheduler_id: str, results: Sequence[ScheduleResult]
+        self,
+        scheduler_id: str,
+        results: Sequence[ScheduleResult],
+        acquisition_tokens: dict[str, int] | None = None,
     ) -> None:
         task_ids = {result.schedule_id: result.task_id for result in results}
         next_fire_times = {
@@ -725,20 +744,20 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             finished_schedule_ids.append(result.schedule_id)
                             continue
 
+                        update_arg: dict[str, Any] = {
+                            "p_id": result.schedule_id,
+                            "p_trigger": serialized_trigger,
+                        }
                         if self._supports_tzaware_timestamps:
-                            update_args.append(
+                            update_arg.update(
                                 {
-                                    "p_id": result.schedule_id,
-                                    "p_trigger": serialized_trigger,
                                     "p_last_fire_time": result.last_fire_time,
                                     "p_next_fire_time": result.next_fire_time,
                                 }
                             )
                         else:
-                            update_args.append(
+                            update_arg.update(
                                 {
-                                    "p_id": result.schedule_id,
-                                    "p_trigger": serialized_trigger,
                                     **marshal_timestamp(
                                         result.last_fire_time, "p_last_fire_time"
                                     ),
@@ -747,6 +766,13 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                     ),
                                 }
                             )
+
+                        if acquisition_tokens is not None:
+                            update_arg["p_acquisition_token"] = acquisition_tokens.get(
+                                result.schedule_id
+                            )
+
+                        update_args.append(update_arg)
 
                     # Update schedules
                     if update_args:
@@ -763,26 +789,58 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                 "p_next_fire_time_utcoffset"
                             )
 
+                        where_clauses = [
+                            self._t_schedules.c.id == p_id,
+                            self._t_schedules.c.acquired_by == scheduler_id,
+                        ]
+                        if acquisition_tokens is not None:
+                            # Fence off stale holders: only the schedule row still
+                            # carrying the caller's acquisition token may be updated.
+                            # coalesce() keeps the comparison NULL-safe for schedules
+                            # that were never previously acquired.
+                            where_clauses.append(
+                                func.coalesce(self._t_schedules.c.acquisition_token, 0)
+                                == func.coalesce(bindparam("p_acquisition_token"), 0)
+                            )
+
                         update = (
                             self._t_schedules.update()
-                            .where(
-                                and_(
-                                    self._t_schedules.c.id == p_id,
-                                    self._t_schedules.c.acquired_by == scheduler_id,
-                                )
-                            )
+                            .where(and_(*where_clauses))
                             .values(
                                 trigger=p_trigger,
                                 last_fire_time=p_last_fire_time,
                                 next_fire_time=p_next_fire_time,
                                 acquired_by=None,
                                 acquired_until=None,
+                                acquisition_token=None,
                                 **extra_values,
                             )
                         )
-                        # TODO: actually check which rows were updated?
-                        await self._execute(conn, update, update_args)
+                        update_result = await self._execute(conn, update, update_args)
+
+                        # Only announce updates for rows that were actually released by
+                        # this holder (a stale token matches no rows)
                         updated_ids = list(next_fire_times)
+                        if update_result.rowcount != len(updated_ids):
+                            current = await self._execute(
+                                conn,
+                                select(
+                                    self._t_schedules.c.id,
+                                    self._t_schedules.c.acquired_by,
+                                ).where(
+                                    self._t_schedules.c.id.in_(
+                                        [arg["p_id"] for arg in update_args]
+                                    )
+                                ),
+                            )
+                            released_ids = {
+                                row.id for row in current if row.acquired_by is None
+                            }
+                            updated_ids = [
+                                schedule_id
+                                for schedule_id in updated_ids
+                                if schedule_id in released_ids
+                            ]
 
                         for schedule_id in updated_ids:
                             event = ScheduleUpdated(
@@ -916,6 +974,10 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     running_job_count_increments: dict[str, int] = defaultdict(
                         lambda: 0
                     )
+                    # Per-task number of re-acquired jobs whose old lease had expired;
+                    # their slots have to be reclaimed before being counted again
+                    expired_slot_reclaims: dict[str, int] = defaultdict(lambda: 0)
+                    acquired_job_updates: list[dict[str, Any]] = []
                     for row in result:
                         job_dict = row._asdict()
                         task_max_running_jobs = job_dict.pop("max_running_jobs")
@@ -939,6 +1001,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                     schedule_id=row.schedule_id,
                                     scheduled_fire_time=row.scheduled_fire_time,
                                     result_expires_at=now + row.result_expiration_time,
+                                    acquisition_token=row.acquisition_token,
                                     exception=exc,
                                 )
                             )
@@ -954,6 +1017,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                     schedule_id=row.schedule_id,
                                     scheduled_fire_time=row.scheduled_fire_time,
                                     result_expires_at=now + row.result_expiration_time,
+                                    acquisition_token=job.acquisition_token,
                                 )
                             )
                             continue
@@ -971,30 +1035,83 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
 
                         task_job_slots_left[job.task_id] -= 1
                         running_job_count_increments[job.task_id] += 1
+                        # A job whose previous lease had expired is still counted in
+                        # the task's running job counter, so reclaim that slot before
+                        # the new acquisition counts it again
+                        if row.acquired_until is not None:
+                            expired_slot_reclaims[job.task_id] += 1
+                        # Issue a new fencing token, invalidating any token still held
+                        # by a previous lease holder
+                        new_token = (job.acquisition_token or 0) + 1
                         job.acquired_by = scheduler_id
                         job.acquired_until = acquired_until
+                        job.acquisition_token = new_token
+                        acquired_job_updates.append(
+                            {
+                                "p_id": job.id,
+                                "p_acquired_by": scheduler_id,
+                                "p_acquired_until": acquired_until,
+                                "p_acquisition_token": new_token,
+                            }
+                        )
                         acquired_jobs.append(job)
                         events.append(
                             JobAcquired.from_job(job, scheduler_id=scheduler_id)
                         )
 
                     if acquired_jobs:
-                        # Mark the acquired jobs as acquired by this worker
-                        acquired_job_ids = [job.id for job in acquired_jobs]
+                        # Mark the acquired jobs as acquired by this worker, bumping
+                        # their fencing tokens. The rows were locked above with
+                        # FOR UPDATE, so matching on the previous token cannot race
+                        # another acquisition inside this transaction.
+                        p_id: BindParameter = bindparam("p_id")
+                        # Rows that have never been acquired carry a NULL token, which
+                        # never equals a bound value in SQL, so compare via coalesce()
                         update = (
                             self._t_jobs.update()
-                            .values(
-                                acquired_by=scheduler_id, acquired_until=acquired_until
+                            .where(
+                                and_(
+                                    self._t_jobs.c.id == p_id,
+                                    func.coalesce(self._t_jobs.c.acquisition_token, 0)
+                                    == bindparam("p_old_acquisition_token"),
+                                )
                             )
-                            .where(self._t_jobs.c.id.in_(acquired_job_ids))
+                            .values(
+                                acquired_by=bindparam("p_acquired_by"),
+                                acquired_until=bindparam("p_acquired_until"),
+                                acquisition_token=bindparam("p_acquisition_token"),
+                            )
                         )
-                        await self._execute(conn, update)
+                        update_params = [
+                            {
+                                "p_id": params["p_id"],
+                                "p_old_acquisition_token": (
+                                    params["p_acquisition_token"] - 1
+                                ),
+                                "p_acquired_by": params["p_acquired_by"],
+                                "p_acquired_until": params["p_acquired_until"],
+                                "p_acquisition_token": params["p_acquisition_token"],
+                            }
+                            for params in acquired_job_updates
+                        ]
+                        update_result = await self._execute(conn, update, update_params)
+                        # The rows were locked above, so every guarded update must
+                        # match the previously observed token
+                        assert update_result.rowcount in (
+                            len(update_params),
+                            -1,
+                        ), update_result.rowcount
 
-                        # Increment the running job counters on each task
-                        p_id: BindParameter = bindparam("p_id")
+                        # Increment the running job counters on each task, subtracting
+                        # the slots reclaimed from expired-lease re-acquisitions so the
+                        # counter is not inflated for jobs that changed holders
                         p_increment: BindParameter = bindparam("p_increment")
                         params = [
-                            {"p_id": task_id, "p_increment": increment}
+                            {
+                                "p_id": task_id,
+                                "p_increment": increment
+                                - expired_slot_reclaims.get(task_id, 0),
+                            }
                             for task_id, increment in running_job_count_increments.items()
                         ]
                         update = (
@@ -1015,17 +1132,19 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             expires_at=discard.result_expires_at,
                             exception=discard.exception,
                         )
-                        events.append(
-                            await self._release_job(
-                                conn,
-                                result,
-                                scheduler_id,
-                                discard.task_id,
-                                discard.schedule_id,
-                                discard.scheduled_fire_time,
-                                decrement_running_job_count=False,
-                            )
+                        release_event = await self._release_job(
+                            conn,
+                            result,
+                            scheduler_id,
+                            discard.task_id,
+                            discard.schedule_id,
+                            discard.scheduled_fire_time,
+                            discard.acquisition_token,
+                            decrement_running_job_count=False,
+                            internal_discard=True,
                         )
+                        if release_event is not None:
+                            events.append(release_event)
 
         # Publish the appropriate events
         for event in events:
@@ -1041,9 +1160,43 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         task_id: str,
         schedule_id: str | None = None,
         scheduled_fire_time: datetime | None = None,
+        acquisition_token: int | None = None,
         *,
         decrement_running_job_count: bool = True,
-    ) -> JobReleased:
+        internal_discard: bool = False,
+    ) -> JobReleased | None:
+        if internal_discard:
+            # Jobs discarded during acquisition (e.g. missed start deadline) were
+            # selected with FOR UPDATE inside this same transaction and may never
+            # have been acquired (NULL owner/token), so release them by ID only.
+            delete = self._t_jobs.delete().where(self._t_jobs.c.id == result.job_id)
+        else:
+            # Delete the job, but only if the caller still holds the current
+            # acquisition. A stale holder (whose lease expired and whose job was
+            # re-acquired by another scheduler, or by the same scheduler under a new
+            # token) matches no row and therefore cannot delete the job, overwrite its
+            # result or touch the task's running job counter. coalesce() makes the
+            # comparison work for jobs that were discarded before ever being acquired
+            # (token is NULL in the database).
+            delete = self._t_jobs.delete().where(
+                and_(
+                    self._t_jobs.c.id == result.job_id,
+                    self._t_jobs.c.acquired_by == scheduler_id,
+                    func.coalesce(self._t_jobs.c.acquisition_token, 0)
+                    == func.coalesce(acquisition_token, 0),
+                )
+            )
+        delete_result = await self._execute(conn, delete)
+        if delete_result.rowcount == 0:
+            self._logger.warning(
+                "Ignoring release of job %s from scheduler %r with a stale acquisition "
+                "token (%r); the lease has been taken over by another holder",
+                result.job_id,
+                scheduler_id,
+                acquisition_token,
+            )
+            return None
+
         # Record the job result
         if result.expires_at > result.finished_at:
             marshalled = result.marshal(self.serializer)
@@ -1059,16 +1212,25 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
             )
             await self._execute(conn, update)
 
-        # Delete the job
-        delete = self._t_jobs.delete().where(self._t_jobs.c.id == result.job_id)
-        await self._execute(conn, delete)
-
         # Create the event, to be sent after commit
         return JobReleased.from_result(
             result, scheduler_id, task_id, schedule_id, scheduled_fire_time
         )
 
-    async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
+    async def release_job(
+        self,
+        scheduler_id: str,
+        job: Job,
+        result: JobResult,
+        acquisition_token: int | None = None,
+    ) -> None:
+        # Capture the token at call time so later re-acquisition cannot change the
+        # fence value underneath us
+        token = (
+            acquisition_token
+            if acquisition_token is not None
+            else job.acquisition_token
+        )
         async for attempt in self._retry():
             with attempt:
                 async with self._begin_transaction() as conn:
@@ -1079,10 +1241,12 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         job.task_id,
                         job.schedule_id,
                         job.scheduled_fire_time,
+                        token,
                     )
 
-        # Notify other schedulers
-        await self._event_broker.publish(event)
+        # Notify other schedulers (only when the release was actually accepted)
+        if event is not None:
+            await self._event_broker.publish(event)
 
     async def get_job_result(self, job_id: UUID) -> JobResult | None:
         async for attempt in self._retry():
@@ -1102,7 +1266,11 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         return JobResult.unmarshal(self.serializer, row._asdict()) if row else None
 
     async def extend_acquired_schedule_leases(
-        self, scheduler_id: str, schedule_ids: set[str], duration: timedelta
+        self,
+        scheduler_id: str,
+        schedule_ids: set[str],
+        duration: timedelta,
+        acquisition_tokens: dict[str, int] | None = None,
     ) -> None:
         async for attempt in self._retry():
             with attempt:
@@ -1116,10 +1284,29 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             self._t_schedules.c.id.in_(schedule_ids),
                         )
                     )
+                    if acquisition_tokens is not None:
+                        # Match each ID with its own token so a stale token can never
+                        # extend a lease that has been handed over to another holder
+                        update = update.where(
+                            or_(
+                                *[
+                                    and_(
+                                        self._t_schedules.c.id == schedule_id,
+                                        self._t_schedules.c.acquisition_token == token,
+                                    )
+                                    for schedule_id, token in acquisition_tokens.items()
+                                ]
+                            )
+                        )
+
                     await self._execute(conn, update)
 
     async def extend_acquired_job_leases(
-        self, scheduler_id: str, job_ids: set[UUID], duration: timedelta
+        self,
+        scheduler_id: str,
+        job_ids: set[UUID],
+        duration: timedelta,
+        acquisition_tokens: dict[UUID, int] | None = None,
     ) -> None:
         async for attempt in self._retry():
             with attempt:
@@ -1133,6 +1320,21 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             self._t_jobs.c.id.in_(job_ids),
                         )
                     )
+                    if acquisition_tokens is not None:
+                        # Match each ID with its own token so a stale token can never
+                        # extend a lease that has been handed over to another holder
+                        update = update.where(
+                            or_(
+                                *[
+                                    and_(
+                                        self._t_jobs.c.id == job_id,
+                                        self._t_jobs.c.acquisition_token == token,
+                                    )
+                                    for job_id, token in acquisition_tokens.items()
+                                ]
+                            )
+                        )
+
                     await self._execute(conn, update)
 
     async def reap_abandoned_jobs(self, scheduler_id: str) -> None:
@@ -1159,8 +1361,10 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                 job.task_id,
                                 job.schedule_id,
                                 job.scheduled_fire_time,
+                                job.acquisition_token,
                             )
-                            events.append(event)
+                            if event is not None:
+                                events.append(event)
 
             for event in events:
                 await self._event_broker.publish(event)
@@ -1184,6 +1388,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         self._t_jobs.c.schedule_id,
                         self._t_jobs.c.scheduled_fire_time,
                         self._t_jobs.c.acquired_by,
+                        self._t_jobs.c.acquisition_token,
                         self._t_jobs.c.result_expiration_time,
                     ).where(
                         self._t_jobs.c.acquired_by.isnot(None),
@@ -1196,16 +1401,17 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             finished_at=now,
                             expires_at=now + row.result_expiration_time,
                         )
-                        events.append(
-                            await self._release_job(
-                                conn,
-                                result,
-                                row.acquired_by,
-                                row.task_id,
-                                row.schedule_id,
-                                row.scheduled_fire_time,
-                            )
+                        release_event = await self._release_job(
+                            conn,
+                            result,
+                            row.acquired_by,
+                            row.task_id,
+                            row.schedule_id,
+                            row.scheduled_fire_time,
+                            row.acquisition_token,
                         )
+                        if release_event is not None:
+                            events.append(release_event)
 
                     # Release any schedules whose leases have expired
                     columns = [
@@ -1236,7 +1442,11 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         update = (
                             self._t_schedules.update()
                             .where(self._t_schedules.c.id.in_(expired_schedule_ids))
-                            .values(acquired_by=None, acquired_until=None)
+                            .values(
+                                acquired_by=None,
+                                acquired_until=None,
+                                acquisition_token=None,
+                            )
                         )
                         await self._execute(conn, update)
 

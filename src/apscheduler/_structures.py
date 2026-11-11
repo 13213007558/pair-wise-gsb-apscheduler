@@ -144,6 +144,9 @@ class Schedule:
         processing
     :var str | None acquired_until: the time after which other schedulers are free to
         acquire the schedule for processing even if it is still marked as acquired
+    :var int | None acquisition_token: monotonically increasing fencing token that
+        identifies the current acquisition; every (re)acquisition bumps it, so a stale
+        holder can be distinguished even when two schedulers share the same ID
     """
 
     id: str = attrs.field(validator=[instance_of(str), min_len(1)], on_setattr=frozen)
@@ -195,6 +198,7 @@ class Schedule:
     acquired_until: datetime | None = attrs.field(
         converter=as_aware_datetime, default=None
     )
+    acquisition_token: int | None = attrs.field(default=None, repr=False)
 
     def marshal(self, serializer: Serializer) -> dict[str, Any]:
         marshalled = attrs.asdict(self, recurse=False, value_serializer=serialize)
@@ -204,6 +208,7 @@ class Schedule:
         if not self.acquired_by:
             del marshalled["acquired_by"]
             del marshalled["acquired_until"]
+            del marshalled["acquisition_token"]
 
         return marshalled
 
@@ -283,6 +288,11 @@ class Job:
         acquired the job for execution
     :var str | None acquired_until: the time after which other schedulers are free to
         acquire the job for processing even if it is still marked as acquired
+    :var int | None acquisition_token: monotonically increasing fencing token that
+        identifies the current acquisition. Every (re)acquisition bumps the token, so a
+        scheduler that lost its lease can be told apart from the current holder even when
+        two schedulers use the same ID. Data stores must reject release or extension
+        calls that present a token different from the one currently stored.
     """
 
     id: UUID = attrs.field(factory=uuid4, on_setattr=frozen)
@@ -317,6 +327,7 @@ class Job:
     acquired_until: datetime | None = attrs.field(
         converter=as_aware_datetime, default=None, repr=False
     )
+    acquisition_token: int | None = attrs.field(default=None, repr=False)
 
     @property
     def original_scheduled_time(self) -> datetime | None:
@@ -333,6 +344,7 @@ class Job:
         if not self.acquired_by:
             del marshalled["acquired_by"]
             del marshalled["acquired_until"]
+            del marshalled["acquisition_token"]
 
         return marshalled
 

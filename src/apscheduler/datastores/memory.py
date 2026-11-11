@@ -5,6 +5,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import MAXYEAR, UTC, datetime, timedelta
 from functools import partial
+from typing import TypeVar
 from uuid import UUID
 
 import attrs
@@ -28,6 +29,28 @@ from .._utils import create_repr
 from .base import BaseDataStore
 
 max_datetime = datetime(MAXYEAR, 12, 31, 23, 59, 59, 999999, tzinfo=UTC)
+
+_T = TypeVar("_T")
+
+
+def _detach(obj: _T) -> _T:
+    """
+    Return a shallow, independent copy of a stored structure.
+
+    Only the structure itself and its own mutable containers (``args``, ``kwargs``
+    and ``metadata``) are copied; referenced values such as task arguments or
+    triggers are shared deliberately. This avoids both accidental mutation of the
+    store's own objects and expensive or impossible deep copies of non-picklable
+    runtime values (e.g. synchronization primitives passed as job arguments).
+
+    """
+    detached = attrs.evolve(  # type: ignore[misc]
+        obj,
+        args=tuple(getattr(obj, "args", ())),
+        kwargs=dict(getattr(obj, "kwargs", {})),
+        metadata=dict(getattr(obj, "metadata", {})),
+    )
+    return detached
 
 
 @attrs.define(eq=False, repr=False)
@@ -59,10 +82,10 @@ class MemoryDataStore(BaseDataStore):
 
     async def get_schedules(self, ids: set[str] | None = None) -> list[Schedule]:
         if ids is None:
-            return self._schedules.copy()
+            return [_detach(schedule) for schedule in self._schedules]
 
         return [
-            schedule
+            _detach(schedule)
             for schedule in self._schedules
             if ids is None or schedule.id in ids
         ]
@@ -167,18 +190,41 @@ class MemoryDataStore(BaseDataStore):
             schedules.append(schedule)
             schedule.acquired_by = scheduler_id
             schedule.acquired_until = acquired_until
+            schedule.acquisition_token = (schedule.acquisition_token or 0) + 1
             if len(schedules) == limit:
                 break
 
-        return schedules
+        # Hand back detached copies so callers can never mutate the store's own
+        # objects (and never observe another holder's later re-acquisition)
+        return [_detach(schedule) for schedule in schedules]
 
     async def release_schedules(
-        self, scheduler_id: str, results: Sequence[ScheduleResult]
+        self,
+        scheduler_id: str,
+        results: Sequence[ScheduleResult],
+        acquisition_tokens: dict[str, int] | None = None,
     ) -> None:
         # Send update events for schedules
         for result in results:
-            # Remove the schedule
             schedule = self._schedules_by_id[result.schedule_id]
+
+            # Fence off stale holders: a schedule re-acquired by another scheduler (or
+            # re-acquired by this same scheduler under a new token) must not be
+            # overwritten by a late release.
+            if schedule.acquired_by != scheduler_id or (
+                acquisition_tokens is not None
+                and schedule.acquisition_token
+                != acquisition_tokens.get(result.schedule_id)
+            ):
+                self._logger.warning(
+                    "Ignoring release of schedule %s from scheduler %r with a stale "
+                    "acquisition token",
+                    result.schedule_id,
+                    scheduler_id,
+                )
+                continue
+
+            # Remove the schedule
             index = self._find_schedule_index(schedule)
             del self._schedules[index]
 
@@ -187,6 +233,7 @@ class MemoryDataStore(BaseDataStore):
             schedule.next_fire_time = result.next_fire_time
             schedule.acquired_by = None
             schedule.acquired_until = None
+            schedule.acquisition_token = None
             insort_right(self._schedules, schedule)
             event = ScheduleUpdated(
                 schedule_id=result.schedule_id,
@@ -227,10 +274,12 @@ class MemoryDataStore(BaseDataStore):
             ids = frozenset(ids)
 
         if ids is None:
-            return list(self._jobs_by_id.values())
+            return [_detach(job) for job in self._jobs_by_id.values()]
 
         return [
-            job for job in self._jobs_by_id.values() if ids is None or job.id in ids
+            _detach(job)
+            for job in self._jobs_by_id.values()
+            if ids is None or job.id in ids
         ]
 
     async def acquire_jobs(
@@ -252,6 +301,11 @@ class MemoryDataStore(BaseDataStore):
 
             # Discard the job if its start deadline has passed
             if job.start_deadline and job.start_deadline < now:
+                # Claim the job for this scheduler first (with a fresh token) so the
+                # fenced release below is recognized as coming from its current holder
+                job.acquired_by = scheduler_id
+                job.acquired_until = acquired_until
+                job.acquisition_token = (job.acquisition_token or 0) + 1
                 job_results[job] = JobResult(
                     job_id=job.id,
                     outcome=JobOutcome.missed_start_deadline,
@@ -274,10 +328,12 @@ class MemoryDataStore(BaseDataStore):
                 )
                 continue
 
-            # Mark the job as acquired by this worker
+            # Mark the job as acquired by this worker, issuing a new fencing token that
+            # invalidates any token held by a previous holder
             jobs.append(job)
             job.acquired_by = scheduler_id
             job.acquired_until = acquired_until
+            job.acquisition_token = (job.acquisition_token or 0) + 1
 
             # Increment the number of running jobs for this task
             task.running_jobs += 1
@@ -294,18 +350,57 @@ class MemoryDataStore(BaseDataStore):
 
         # Discard the jobs that could not start
         for job, result in job_results.items():
-            await self.release_job(scheduler_id, job, result)
+            event = await self._release_job(
+                scheduler_id,
+                job,
+                result,
+                job.acquisition_token,
+                decrement_running_job_count=False,
+            )
+            if event is not None:
+                await self._event_broker.publish(event)
 
-        return jobs
+        # Hand back detached copies so callers can never mutate the store's own
+        # objects (and never observe another holder's later re-acquisition)
+        return [_detach(job) for job in jobs]
 
-    async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
+    async def _release_job(
+        self,
+        scheduler_id: str,
+        job: Job,
+        result: JobResult,
+        acquisition_token: int | None,
+        *,
+        decrement_running_job_count: bool = True,
+    ) -> JobReleased | None:
+        stored_job = self._jobs_by_id.get(result.job_id)
+
+        # Fence off stale holders: if the job has been (re)acquired since the caller
+        # got its token, the caller no longer owns this lease and must not touch the
+        # job, its result or the task's running job counter.
+        if (
+            stored_job is None
+            or stored_job.acquired_by != scheduler_id
+            or stored_job.acquisition_token != acquisition_token
+        ):
+            self._logger.warning(
+                "Ignoring release of job %s from scheduler %r with a stale acquisition "
+                "token (%r); the job is now held under token %r by %r",
+                result.job_id,
+                scheduler_id,
+                acquisition_token,
+                stored_job.acquisition_token if stored_job is not None else None,
+                stored_job.acquired_by if stored_job is not None else None,
+            )
+            return None
+
         # Record the job result
         if result.expires_at > result.finished_at:
             self._job_results[result.job_id] = result
 
         # Decrement the number of running jobs for this task
-        if job.acquired_by:
-            self._tasks[job.task_id].running_jobs -= 1
+        if decrement_running_job_count and stored_job.acquired_by:
+            self._tasks[stored_job.task_id].running_jobs -= 1
 
         # Delete the job
         job = self._jobs_by_id.pop(result.job_id)
@@ -325,34 +420,76 @@ class MemoryDataStore(BaseDataStore):
                 del self._jobs_by_schedule_id[job.schedule_id]
 
         # Notify other schedulers
-        await self._event_broker.publish(
-            JobReleased.from_result(
-                result,
-                scheduler_id,
-                job.task_id,
-                job.schedule_id,
-                job.scheduled_fire_time,
-            )
+        return JobReleased.from_result(
+            result,
+            scheduler_id,
+            job.task_id,
+            job.schedule_id,
+            job.scheduled_fire_time,
         )
+
+    async def release_job(
+        self,
+        scheduler_id: str,
+        job: Job,
+        result: JobResult,
+        acquisition_token: int | None = None,
+    ) -> None:
+        # Capture the token at call time so a later (re)acquisition mutating the same
+        # in-memory object cannot make this call pass the fence retroactively.
+        token = (
+            acquisition_token
+            if acquisition_token is not None
+            else job.acquisition_token
+        )
+        event = await self._release_job(scheduler_id, job, result, token)
+        if event is not None:
+            await self._event_broker.publish(event)
 
     async def get_job_result(self, job_id: UUID) -> JobResult | None:
         return self._job_results.pop(job_id, None)
 
     async def extend_acquired_schedule_leases(
-        self, scheduler_id: str, schedule_ids: set[str], duration: timedelta
+        self,
+        scheduler_id: str,
+        schedule_ids: set[str],
+        duration: timedelta,
+        acquisition_tokens: dict[str, int] | None = None,
     ) -> None:
         acquired_until = datetime.now(UTC) + duration
         for schedule in self._schedules:
-            if schedule.acquired_by == scheduler_id and schedule.id in schedule_ids:
-                schedule.acquired_until = acquired_until
+            if schedule.acquired_by != scheduler_id or schedule.id not in schedule_ids:
+                continue
+
+            # Only extend the lease if the caller still holds this acquisition
+            if (
+                acquisition_tokens is not None
+                and schedule.acquisition_token != acquisition_tokens.get(schedule.id)
+            ):
+                continue
+
+            schedule.acquired_until = acquired_until
 
     async def extend_acquired_job_leases(
-        self, scheduler_id: str, job_ids: set[UUID], duration: timedelta
+        self,
+        scheduler_id: str,
+        job_ids: set[UUID],
+        duration: timedelta,
+        acquisition_tokens: dict[UUID, int] | None = None,
     ) -> None:
         acquired_until = datetime.now(UTC) + duration
         for job in self._jobs_by_id.values():
-            if job.acquired_by == scheduler_id and job.id in job_ids:
-                job.acquired_until = acquired_until
+            if job.acquired_by != scheduler_id or job.id not in job_ids:
+                continue
+
+            # Only extend the lease if the caller still holds this acquisition
+            if (
+                acquisition_tokens is not None
+                and job.acquisition_token != acquisition_tokens.get(job.id)
+            ):
+                continue
+
+            job.acquired_until = acquired_until
 
     async def reap_abandoned_jobs(self, scheduler_id: str) -> None:
         now = datetime.now(UTC)
@@ -361,7 +498,14 @@ class MemoryDataStore(BaseDataStore):
                 result = JobResult.from_job(
                     job=job, outcome=JobOutcome.abandoned, finished_at=now
                 )
-                await self.release_job(job.acquired_by, job, result)
+                event = await self._release_job(
+                    job.acquired_by,
+                    job,
+                    result,
+                    job.acquisition_token,
+                )
+                if event is not None:
+                    await self._event_broker.publish(event)
 
     async def cleanup(self) -> None:
         # Clean up expired job results
@@ -385,19 +529,27 @@ class MemoryDataStore(BaseDataStore):
                 job=job, outcome=JobOutcome.abandoned, finished_at=now
             )
             assert job.acquired_by is not None
-            await self.release_job(job.acquired_by, job, result)
+            event = await self._release_job(
+                job.acquired_by,
+                job,
+                result,
+                job.acquisition_token,
+            )
+            if event is not None:
+                await self._event_broker.publish(event)
 
         # Release any schedules whose leases have expired
         for schedule in self._schedules:
             if schedule.acquired_until is not None and schedule.acquired_until < now:
                 schedule.acquired_by = None
                 schedule.acquired_until = None
-                event = ScheduleUpdated(
+                schedule.acquisition_token = None
+                schedule_event = ScheduleUpdated(
                     schedule_id=schedule.id,
                     task_id=schedule.task_id,
                     next_fire_time=schedule.next_fire_time,
                 )
-                await self._event_broker.publish(event)
+                await self._event_broker.publish(schedule_event)
 
         # Clean up finished schedules that have no running jobs
         finished_schedule_ids = [

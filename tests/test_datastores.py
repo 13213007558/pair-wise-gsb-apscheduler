@@ -22,6 +22,7 @@ from apscheduler import (
     Event,
     Job,
     JobOutcome,
+    JobReleased,
     JobResult,
     Schedule,
     ScheduleAdded,
@@ -923,6 +924,382 @@ async def test_reap_abandoned_jobs(
 
     task = await datastore.get_task("task1")
     assert task.running_jobs == 0
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_stale_job_release_after_lease_handoff(
+    datastore: DataStore, time_machine: TimeMachineFixture
+) -> None:
+    """
+    A late result from a worker that lost its lease must not delete the job taken over
+    by another worker, overwrite its result or decrement the running job counter twice.
+
+    """
+    task = Task(
+        id="task1",
+        func="contextlib:asynccontextmanager",
+        job_executor="async",
+        max_running_jobs=10,
+    )
+    await datastore.add_task(task)
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+
+    time_machine.move_to(datetime.now(UTC), tick=False)
+
+    # Worker A acquires the job
+    jobs_a = await datastore.acquire_jobs("workerA", timedelta(seconds=30), 1)
+    assert len(jobs_a) == 1
+    job_a = jobs_a[0]
+    token_a = job_a.acquisition_token
+    assert token_a is not None
+    assert (await datastore.get_task("task1")).running_jobs == 1
+
+    # The lease expires and worker B takes the job over with a new token
+    time_machine.shift(31)
+    jobs_b = await datastore.acquire_jobs("workerB", timedelta(seconds=30), 1)
+    assert len(jobs_b) == 1
+    job_b = jobs_b[0]
+    assert job_b.id == job.id
+    token_b = job_b.acquisition_token
+    assert token_b is not None and token_b != token_a
+    # Re-acquisition must not inflate the running job counter
+    assert (await datastore.get_task("task1")).running_jobs == 1
+
+    # Worker A recovers and submits a (now stale) result
+    stale_result = JobResult.from_job(job_a, JobOutcome.success, return_value="A")
+    await datastore.release_job("workerA", job_a, stale_result, token_a)
+
+    # The job still exists, still owned by B, and A's result was not recorded
+    remaining = await datastore.get_jobs({job.id})
+    assert len(remaining) == 1
+    assert remaining[0].acquired_by == "workerB"
+    assert remaining[0].acquisition_token == token_b
+    assert await datastore.get_job_result(job.id) is None
+    assert (await datastore.get_task("task1")).running_jobs == 1
+
+    # Worker B releases normally: its result is the one that survives and the counter
+    # is released exactly once
+    async with capture_events(datastore, 1, {JobReleased}) as events:
+        result_b = JobResult.from_job(job_b, JobOutcome.success, return_value="B")
+        await datastore.release_job("workerB", job_b, result_b, token_b)
+
+    assert len(events) == 1
+    assert events[0].scheduler_id == "workerB"
+    stored = await datastore.get_job_result(job.id)
+    assert stored is not None and stored.return_value == "B"
+    assert not await datastore.get_jobs({job.id})
+    assert (await datastore.get_task("task1")).running_jobs == 0
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_stale_job_release_same_scheduler_id(
+    datastore: DataStore, time_machine: TimeMachineFixture
+) -> None:
+    """
+    Two schedulers sharing the same ID (e.g. a restarted process) must still be
+    distinguished by the fencing token.
+
+    """
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+
+    time_machine.move_to(datetime.now(UTC), tick=False)
+    first = await datastore.acquire_jobs("same-id", timedelta(seconds=30), 1)
+    assert len(first) == 1
+    old_token = first[0].acquisition_token
+
+    time_machine.shift(31)
+    second = await datastore.acquire_jobs("same-id", timedelta(seconds=30), 1)
+    assert len(second) == 1
+    new_token = second[0].acquisition_token
+    assert new_token != old_token
+
+    # The first incarnation releases with the old token
+    await datastore.release_job(
+        "same-id",
+        first[0],
+        JobResult.from_job(first[0], JobOutcome.success),
+        old_token,
+    )
+    assert len(await datastore.get_jobs({job.id})) == 1
+
+    # The current incarnation can still release with the new token
+    await datastore.release_job(
+        "same-id",
+        second[0],
+        JobResult.from_job(second[0], JobOutcome.success),
+        new_token,
+    )
+    assert not await datastore.get_jobs({job.id})
+
+
+async def test_release_with_wrong_token_is_ignored(datastore: DataStore) -> None:
+    """A fabricated/unknown token can never release a job."""
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+
+    acquired = await datastore.acquire_jobs("workerA", timedelta(seconds=30), 1)
+    assert len(acquired) == 1
+    real_token = acquired[0].acquisition_token
+
+    async with capture_events(datastore, 1, {JobReleased}) as events:
+        await datastore.release_job(
+            "workerA",
+            acquired[0],
+            JobResult.from_job(acquired[0], JobOutcome.success),
+            (real_token or 0) + 999,
+        )
+        # The holder using the correct token still succeeds
+        await datastore.release_job(
+            "workerA",
+            acquired[0],
+            JobResult.from_job(acquired[0], JobOutcome.success),
+            real_token,
+        )
+
+    assert len(events) == 1
+    assert not await datastore.get_jobs({job.id})
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_stale_lease_extension_does_not_revive_handed_off_job(
+    datastore: DataStore, time_machine: TimeMachineFixture
+) -> None:
+    """A stale holder cannot extend a lease that has already been handed over."""
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+
+    time_machine.move_to(datetime.now(UTC), tick=False)
+    job_a = (await datastore.acquire_jobs("workerA", timedelta(seconds=30), 1))[0]
+    token_a = job_a.acquisition_token
+
+    time_machine.shift(31)
+    job_b = (await datastore.acquire_jobs("workerB", timedelta(seconds=30), 1))[0]
+    token_b = job_b.acquisition_token
+
+    # A's stale extension attempt must not touch B's lease
+    time_machine.shift(10)
+    await datastore.extend_acquired_job_leases(
+        "workerA", {job.id}, timedelta(seconds=30), {job.id: token_a}
+    )
+    stored = (await datastore.get_jobs({job.id}))[0]
+    assert stored.acquired_by == "workerB"
+    assert stored.acquisition_token == token_b
+    # B's lease (30 s from re-acquisition) is still in effect
+    assert stored.acquired_until > datetime.now(UTC)
+
+    # B's own extension works
+    await datastore.extend_acquired_job_leases(
+        "workerB", {job.id}, timedelta(seconds=30), {job.id: token_b}
+    )
+    stored = (await datastore.get_jobs({job.id}))[0]
+    assert stored.acquired_by == "workerB"
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_cleanup_does_not_release_reacquired_job(
+    datastore: DataStore, time_machine: TimeMachineFixture
+) -> None:
+    """Cleanup must only reap jobs whose current lease is expired."""
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+
+    time_machine.move_to(datetime.now(UTC), tick=False)
+    job_a = (await datastore.acquire_jobs("workerA", timedelta(seconds=30), 1))[0]
+
+    time_machine.shift(31)
+    # B re-acquires with a fresh 30 s lease
+    job_b = (await datastore.acquire_jobs("workerB", timedelta(seconds=30), 1))[0]
+    assert job_b.acquisition_token != job_a.acquisition_token
+
+    # Cleanup runs while B's lease is still valid
+    await datastore.cleanup()
+    remaining = await datastore.get_jobs({job.id})
+    assert len(remaining) == 1
+    assert remaining[0].acquired_by == "workerB"
+    assert await datastore.get_job_result(job.id) is None
+    assert (await datastore.get_task("task1")).running_jobs == 1
+
+
+async def test_missed_start_deadline_still_releases_and_publishes(
+    datastore: DataStore,
+) -> None:
+    """A job whose start deadline already passed is discarded with a release event."""
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    past = datetime.now(UTC) - timedelta(seconds=1)
+    job = Job(
+        task_id="task1",
+        executor="async",
+        start_deadline=past,
+        result_expiration_time=timedelta(minutes=1),
+    )
+    await datastore.add_job(job)
+
+    async with capture_events(datastore, 1, {JobReleased}) as events:
+        acquired = await datastore.acquire_jobs("workerA", timedelta(seconds=30), 1)
+
+    assert acquired == []
+    assert len(events) == 1
+    assert events[0].outcome is JobOutcome.missed_start_deadline
+    assert not await datastore.get_jobs({job.id})
+    result = await datastore.get_job_result(job.id)
+    assert result is not None and result.outcome is JobOutcome.missed_start_deadline
+    assert (await datastore.get_task("task1")).running_jobs == 0
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_stale_schedule_release_after_lease_handoff(
+    datastore: DataStore, time_machine: TimeMachineFixture
+) -> None:
+    """A late schedule release must not overwrite a schedule re-acquired by another."""
+    trigger = DateTrigger(datetime(2020, 9, 13, tzinfo=UTC))
+    schedule = Schedule(id="s1", task_id="task1", job_executor="async", trigger=trigger)
+    schedule.next_fire_time = trigger.next()
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    await datastore.add_schedule(schedule, ConflictPolicy.exception)
+
+    time_machine.move_to(datetime(2020, 9, 13, tzinfo=UTC), tick=False)
+    schedules_a = await datastore.acquire_schedules("workerA", timedelta(seconds=30), 1)
+    assert len(schedules_a) == 1
+    token_a = schedules_a[0].acquisition_token
+    assert token_a is not None
+
+    time_machine.shift(31)
+    schedules_b = await datastore.acquire_schedules("workerB", timedelta(seconds=30), 1)
+    assert len(schedules_b) == 1
+    token_b = schedules_b[0].acquisition_token
+    assert token_b != token_a
+
+    # A's stale release carrying the old token is ignored
+    stale_result = ScheduleResult(
+        schedule_id="s1",
+        task_id="task1",
+        trigger=trigger,
+        last_fire_time=datetime(2020, 9, 13, tzinfo=UTC),
+        next_fire_time=None,
+    )
+    await datastore.release_schedules("workerA", [stale_result], {"s1": token_a})
+
+    stored = await datastore.get_schedules({"s1"})
+    assert len(stored) == 1
+    assert stored[0].acquired_by == "workerB"
+    assert stored[0].acquisition_token == token_b
+    assert stored[0].next_fire_time is not None
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_repeated_acquisition_bumps_token(
+    datastore: DataStore, time_machine: TimeMachineFixture
+) -> None:
+    """Each acquisition produces a distinct, monotonically increasing token."""
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+
+    time_machine.move_to(datetime.now(UTC), tick=False)
+    tokens = []
+    for i in range(1, 4):
+        acquired = await datastore.acquire_jobs("worker", timedelta(seconds=30), 1)
+        assert len(acquired) == 1
+        token = acquired[0].acquisition_token
+        assert token == i
+        tokens.append(token)
+        time_machine.shift(31)
+
+    assert len(set(tokens)) == 3
+    # The job is still present and carries the latest token
+    remaining = await datastore.get_jobs({job.id})
+    assert len(remaining) == 1
+    assert remaining[0].acquisition_token == 3
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_acquired_job_is_detached_from_store_object(
+    datastore: DataStore, time_machine: TimeMachineFixture
+) -> None:
+    """
+    The job object handed to a scheduler must be independent from the store's own
+    copy, so a later re-acquisition cannot retroactively change the token a stale
+    holder uses when releasing.
+
+    """
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    job = Job(
+        task_id="task1", executor="async", result_expiration_time=timedelta(minutes=1)
+    )
+    await datastore.add_job(job)
+
+    time_machine.move_to(datetime.now(UTC), tick=False)
+    job_a = (await datastore.acquire_jobs("workerA", timedelta(seconds=30), 1))[0]
+    token_a = job_a.acquisition_token
+
+    # Mutating the returned object must not change the store's ownership state
+    job_a.acquisition_token = 9999
+    stored = (await datastore.get_jobs({job.id}))[0]
+    assert stored.acquisition_token == token_a
+    job_a.acquisition_token = token_a
+
+    # After the lease expires, a fresh acquisition returns a separate object with a
+    # new token while the stale holder's object keeps its original token
+    time_machine.shift(31)
+    job_b = (await datastore.acquire_jobs("workerB", timedelta(seconds=30), 1))[0]
+    assert job_b is not job_a
+    assert job_b.acquisition_token != token_a
+    assert job_a.acquisition_token == token_a
 
 
 class TestRepr:

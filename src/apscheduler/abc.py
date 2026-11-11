@@ -266,7 +266,10 @@ class DataStore(metaclass=ABCMeta):
 
     @abstractmethod
     async def release_schedules(
-        self, scheduler_id: str, results: Sequence[ScheduleResult]
+        self,
+        scheduler_id: str,
+        results: Sequence[ScheduleResult],
+        acquisition_tokens: dict[str, int] | None = None,
     ) -> None:
         """
         Release the claims on the given schedules and update them on the store.
@@ -279,9 +282,18 @@ class DataStore(metaclass=ABCMeta):
         * ``trigger``
         * ``acquired_by`` (must beset to ``None``)
         * ``acquired_until`` (must be set to ``None``)
+        * ``acquisition_token`` (must be set to ``None``)
+
+        When ``acquisition_tokens`` is provided, it maps schedule IDs to the fencing
+        token returned by :meth:`acquire_schedules`. A release whose token no longer
+        matches the stored one (because the lease expired and the schedule was
+        re-acquired, possibly by a scheduler using the same ID) must be ignored
+        instead of overwriting the current holder's state.
 
         :param scheduler_id: unique identifier of the scheduler
         :param results: list of schedule processing results
+        :param acquisition_tokens: fencing tokens the scheduler holds for the
+            schedules being released (``None`` disables the token check)
         """
 
     @abstractmethod
@@ -317,7 +329,9 @@ class DataStore(metaclass=ABCMeta):
         Acquire unclaimed jobs for execution.
 
         This method claims up to the requested number of jobs for the given scheduler
-        and returns them.
+        and returns them. Every acquired job receives a monotonically increasing
+        ``acquisition_token`` that uniquely identifies this acquisition, so that later
+        releases can be fenced off once the lease has been handed over.
 
         :param scheduler_id: unique identifier of the scheduler
         :param lease_duration: the duration of the lease, after which the jobs will be
@@ -327,13 +341,29 @@ class DataStore(metaclass=ABCMeta):
         """
 
     @abstractmethod
-    async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
+    async def release_job(
+        self,
+        scheduler_id: str,
+        job: Job,
+        result: JobResult,
+        acquisition_token: int | None = None,
+    ) -> None:
         """
         Release the claim on the given job and record the result.
+
+        When ``acquisition_token`` is provided, the data store must only accept the
+        release if the job is still held under exactly that token (and by the given
+        scheduler). If the lease has expired in the meantime and the job has been
+        re-acquired under a new token – even by a scheduler using the same
+        ``scheduler_id`` – the stale release must be a no-op: it must not delete the
+        job, record a result, decrement any running-job counter or publish a
+        :class:`~apscheduler.JobReleased` event.
 
         :param scheduler_id: unique identifier of the scheduler
         :param job: the job to be released
         :param result: the result of the job
+        :param acquisition_token: fencing token the scheduler holds for the job
+            (defaults to the token currently attached to ``job``)
         """
 
     @abstractmethod
@@ -349,27 +379,47 @@ class DataStore(metaclass=ABCMeta):
 
     @abstractmethod
     async def extend_acquired_schedule_leases(
-        self, scheduler_id: str, schedule_ids: set[str], duration: timedelta
+        self,
+        scheduler_id: str,
+        schedule_ids: set[str],
+        duration: timedelta,
+        acquisition_tokens: dict[str, int] | None = None,
     ) -> None:
         """
         Extend the leases of specified schedules acquired by the given scheduler.
 
+        When ``acquisition_tokens`` is provided, leases are only extended while the
+        stored token still matches the one the scheduler holds; a schedule whose lease
+        was handed over to another holder is left untouched.
+
         :param scheduler_id: unique identifier of the scheduler
-        :param schedule_ids: the identifiers of the schedules the scheduler is currently
-            processing
+        :param schedule_ids: the identifiers of the schedules the scheduler is
+            currently processing
         :param duration: the duration by which to extend the leases
+        :param acquisition_tokens: mapping of schedule IDs to the fencing tokens the
+            scheduler currently holds (``None`` disables the token check)
         """
 
     @abstractmethod
     async def extend_acquired_job_leases(
-        self, scheduler_id: str, job_ids: set[UUID], duration: timedelta
+        self,
+        scheduler_id: str,
+        job_ids: set[UUID],
+        duration: timedelta,
+        acquisition_tokens: dict[UUID, int] | None = None,
     ) -> None:
         """
         Extend the leases of specified jobs acquired by the given scheduler.
 
+        When ``acquisition_tokens`` is provided, leases are only extended while the
+        stored token still matches the one the scheduler holds; a job whose lease was
+        handed over to another holder is left untouched.
+
         :param scheduler_id: unique identifier of the scheduler
         :param job_ids: the identifiers of the jobs the scheduler is running
         :param duration: the duration by which to extend the leases
+        :param acquisition_tokens: mapping of job IDs to the fencing tokens the
+            scheduler currently holds (``None`` disables the token check)
         """
 
     @abstractmethod

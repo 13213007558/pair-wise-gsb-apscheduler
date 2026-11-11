@@ -386,7 +386,8 @@ class MongoDBDataStore(BaseExternalDataStore):
                             "$set": {
                                 "acquired_by": scheduler_id,
                                 **marshal_timestamp(acquired_until, "acquired_until"),
-                            }
+                            },
+                            "$inc": {"acquisition_token": 1},
                         },
                         session=session,
                     )
@@ -419,7 +420,10 @@ class MongoDBDataStore(BaseExternalDataStore):
                 return schedules
 
     async def release_schedules(
-        self, scheduler_id: str, results: Sequence[ScheduleResult]
+        self,
+        scheduler_id: str,
+        results: Sequence[ScheduleResult],
+        acquisition_tokens: dict[str, int] | None = None,
     ) -> None:
         updated_schedules: list[tuple[str, datetime | None]] = []
         finished_schedule_ids: list[str] = []
@@ -427,7 +431,16 @@ class MongoDBDataStore(BaseExternalDataStore):
 
         requests: list[UpdateOne | DeleteOne] = []
         for result in results:
-            filters = {"_id": result.schedule_id, "acquired_by": scheduler_id}
+            filters: dict[str, Any] = {
+                "_id": result.schedule_id,
+                "acquired_by": scheduler_id,
+            }
+            if acquisition_tokens is not None:
+                # Fence off stale holders: only the document still carrying the
+                # caller's token may be released
+                filters["acquisition_token"] = acquisition_tokens.get(
+                    result.schedule_id
+                )
             try:
                 serialized_trigger = self.serializer.serialize(result.trigger)
             except SerializationError:
@@ -444,6 +457,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                     "acquired_by": True,
                     "acquired_until": True,
                     "acquired_until_utcoffset": True,
+                    "acquisition_token": True,
                 },
                 "$set": {
                     "trigger": serialized_trigger,
@@ -573,7 +587,8 @@ class MongoDBDataStore(BaseExternalDataStore):
                         "$set": {
                             "acquired_by": scheduler_id,
                             **marshal_timestamp(acquired_until, "acquired_until"),
-                        }
+                        },
+                        "$inc": {"acquisition_token": 1},
                     },
                 )
 
@@ -613,17 +628,19 @@ class MongoDBDataStore(BaseExternalDataStore):
                             + timedelta(seconds=doc["result_expiration_time"]),
                             exception=exc,
                         )
-                        events.append(
-                            await self._release_job(
-                                session,
-                                result,
-                                scheduler_id,
-                                doc["task_id"],
-                                doc["schedule_id"],
-                                doc["scheduled_fire_time"],
-                                decrement_running_job_count=False,
-                            )
+                        release_event = await self._release_job(
+                            session,
+                            result,
+                            scheduler_id,
+                            doc["task_id"],
+                            doc["schedule_id"],
+                            doc["scheduled_fire_time"],
+                            doc.get("acquisition_token"),
+                            decrement_running_job_count=False,
+                            internal_discard=True,
                         )
+                        if release_event is not None:
+                            events.append(release_event)
                         continue
 
                     # Discard the job if its start deadline has passed
@@ -633,17 +650,19 @@ class MongoDBDataStore(BaseExternalDataStore):
                             JobOutcome.missed_start_deadline,
                             finished_at=now,
                         )
-                        events.append(
-                            await self._release_job(
-                                session,
-                                result,
-                                scheduler_id,
-                                job.task_id,
-                                job.schedule_id,
-                                job.scheduled_fire_time,
-                                decrement_running_job_count=False,
-                            )
+                        release_event = await self._release_job(
+                            session,
+                            result,
+                            scheduler_id,
+                            job.task_id,
+                            job.schedule_id,
+                            job.scheduled_fire_time,
+                            job.acquisition_token,
+                            decrement_running_job_count=False,
+                            internal_discard=True,
                         )
+                        if release_event is not None:
+                            events.append(release_event)
                         continue
 
                     # Try to increment the task's running jobs count
@@ -675,8 +694,11 @@ class MongoDBDataStore(BaseExternalDataStore):
                         skipped_job_ids.append(job.id)
                         continue
 
+                    # The acquisition update above bumped the token; reflect the new
+                    # value on the object handed to the scheduler
                     job.acquired_by = scheduler_id
                     job.acquired_until = now + lease_duration
+                    job.acquisition_token = (job.acquisition_token or 0) + 1
                     acquired_jobs.append(job)
                     events.append(JobAcquired.from_job(job, scheduler_id=scheduler_id))
 
@@ -692,6 +714,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                                 "acquired_by": True,
                                 "acquired_until": True,
                                 "acquired_until_utcoffset": True,
+                                "acquisition_token": True,
                             },
                         },
                     )
@@ -710,18 +733,46 @@ class MongoDBDataStore(BaseExternalDataStore):
         task_id: str,
         schedule_id: str | None = None,
         scheduled_fire_time: datetime | None = None,
+        acquisition_token: int | None = None,
         *,
         decrement_running_job_count: bool = True,
-    ) -> JobReleased:
+        internal_discard: bool = False,
+    ) -> JobReleased | None:
+        if internal_discard:
+            # Jobs discarded during acquisition (e.g. missed start deadline) were
+            # selected inside this same session and may never have been acquired
+            # (missing owner/token), so release them by ID only.
+            delete_filters: dict[str, Any] = {"_id": result.job_id}
+        else:
+            # Delete the job, but only if the caller still holds the current
+            # acquisition. A stale holder (whose lease expired and whose job was
+            # re-acquired under a new token) matches no document and therefore cannot
+            # delete the job, overwrite its result or touch the task's running job
+            # counter.
+            delete_filters = {
+                "_id": result.job_id,
+                "acquired_by": scheduler_id,
+            }
+            if acquisition_token is not None:
+                delete_filters["acquisition_token"] = acquisition_token
+
+        deleted = await self._jobs.delete_one(delete_filters, session=session)
+        if deleted.deleted_count == 0:
+            self._logger.warning(
+                "Ignoring release of job %s from scheduler %r with a stale acquisition "
+                "token (%r); the lease has been taken over by another holder",
+                result.job_id,
+                scheduler_id,
+                acquisition_token,
+            )
+            return None
+
         # Record the job result
         if result.expires_at > result.finished_at:
             document = result.marshal(self.serializer)
             document["_id"] = document.pop("job_id")
             marshal_document(document)
             await self._jobs_results.insert_one(document, session=session)
-
-        # Delete the job
-        await self._jobs.delete_one({"_id": result.job_id}, session=session)
 
         # Decrement the running jobs counter if the job had been successfully acquired
         if decrement_running_job_count:
@@ -736,7 +787,20 @@ class MongoDBDataStore(BaseExternalDataStore):
             result, scheduler_id, task_id, schedule_id, scheduled_fire_time
         )
 
-    async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
+    async def release_job(
+        self,
+        scheduler_id: str,
+        job: Job,
+        result: JobResult,
+        acquisition_token: int | None = None,
+    ) -> None:
+        # Capture the token at call time so later re-acquisition cannot change the
+        # fence value underneath us
+        token = (
+            acquisition_token
+            if acquisition_token is not None
+            else job.acquisition_token
+        )
         async for attempt in self._retry():
             with attempt:
                 async with self._client.start_session() as session:
@@ -747,10 +811,12 @@ class MongoDBDataStore(BaseExternalDataStore):
                         job.task_id,
                         job.schedule_id,
                         job.scheduled_fire_time,
+                        token,
                     )
 
-                    # Notify other schedulers
-                    await self._event_broker.publish(event)
+                    # Notify other schedulers (only when the release was accepted)
+                    if event is not None:
+                        await self._event_broker.publish(event)
 
     async def get_job_result(self, job_id: UUID) -> JobResult | None:
         async for attempt in self._retry():
@@ -765,33 +831,67 @@ class MongoDBDataStore(BaseExternalDataStore):
             return None
 
     async def extend_acquired_schedule_leases(
-        self, scheduler_id: str, schedule_ids: set[str], duration: timedelta
+        self,
+        scheduler_id: str,
+        schedule_ids: set[str],
+        duration: timedelta,
+        acquisition_tokens: dict[str, int] | None = None,
     ) -> None:
         async for attempt in self._retry():
             with attempt:
                 async with self._client.start_session() as session:
                     new_acquired_until = (datetime.now(UTC) + duration).timestamp()
+                    filters: dict[str, Any] = {
+                        "acquired_by": scheduler_id,
+                        "_id": {"$in": list(schedule_ids)},
+                    }
+                    if acquisition_tokens is not None:
+                        # Match each ID with its own token so a stale token can never
+                        # extend a lease handed over to another holder
+                        filters["$and"] = [
+                            {
+                                "$or": [
+                                    {"_id": schedule_id, "acquisition_token": token}
+                                    for schedule_id, token in acquisition_tokens.items()
+                                ]
+                            }
+                        ]
+
                     await self._schedules.update_many(
-                        filter={
-                            "acquired_by": scheduler_id,
-                            "_id": {"$in": list(schedule_ids)},
-                        },
+                        filter=filters,
                         update={"$set": {"acquired_until": new_acquired_until}},
                         session=session,
                     )
 
     async def extend_acquired_job_leases(
-        self, scheduler_id: str, job_ids: set[UUID], duration: timedelta
+        self,
+        scheduler_id: str,
+        job_ids: set[UUID],
+        duration: timedelta,
+        acquisition_tokens: dict[UUID, int] | None = None,
     ) -> None:
         async for attempt in self._retry():
             with attempt:
                 async with self._client.start_session() as session:
                     new_acquired_until = (datetime.now(UTC) + duration).timestamp()
+                    filters: dict[str, Any] = {
+                        "acquired_by": scheduler_id,
+                        "_id": {"$in": list(job_ids)},
+                    }
+                    if acquisition_tokens is not None:
+                        # Match each ID with its own token so a stale token can never
+                        # extend a lease handed over to another holder
+                        filters["$and"] = [
+                            {
+                                "$or": [
+                                    {"_id": job_id, "acquisition_token": token}
+                                    for job_id, token in acquisition_tokens.items()
+                                ]
+                            }
+                        ]
+
                     await self._jobs.update_many(
-                        filter={
-                            "acquired_by": scheduler_id,
-                            "_id": {"$in": list(job_ids)},
-                        },
+                        filter=filters,
                         update={"$set": {"acquired_until": new_acquired_until}},
                         session=session,
                     )
@@ -821,8 +921,10 @@ class MongoDBDataStore(BaseExternalDataStore):
                             job.task_id,
                             job.schedule_id,
                             job.scheduled_fire_time,
+                            job.acquisition_token,
                         )
-                        events.append(event)
+                        if event is not None:
+                            events.append(event)
 
             for event in events:
                 await self._event_broker.publish(event)
@@ -863,6 +965,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                         projection=[
                             "_id",
                             "acquired_by",
+                            "acquisition_token",
                             "task_id",
                             "schedule_id",
                             "scheduled_fire_time",
@@ -879,16 +982,17 @@ class MongoDBDataStore(BaseExternalDataStore):
                                 expires_at=now
                                 + timedelta(seconds=doc["result_expiration_time"]),
                             )
-                            events.append(
-                                await self._release_job(
-                                    session,
-                                    result,
-                                    doc["acquired_by"],
-                                    doc["task_id"],
-                                    doc["schedule_id"],
-                                    doc["scheduled_fire_time"],
-                                )
+                            release_event = await self._release_job(
+                                session,
+                                result,
+                                doc["acquired_by"],
+                                doc["task_id"],
+                                doc["schedule_id"],
+                                doc["scheduled_fire_time"],
+                                doc.get("acquisition_token"),
                             )
+                            if release_event is not None:
+                                events.append(release_event)
 
                     # Release any schedules whose leases have expired
                     expired_schedule_ids: list[str] = []
@@ -921,6 +1025,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                                     "acquired_by": True,
                                     "acquired_until": True,
                                     "acquired_until_utcoffset": True,
+                                    "acquisition_token": True,
                                 }
                             },
                             session=session,
